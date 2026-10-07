@@ -368,6 +368,92 @@ else:
     fail("❌ 入口 plist 格式不对（必须是 { entry = { bundle/cell/detail/isController }; }）")
 
 # ---------------------------------------------------------------------------
+print("--- 检查 21：⭐ prefs 侧必须声明 PSListController（否则 19 连错）---")
+# 血泪（2026-10-07 首轮 CI）：prefs 的 .m 只 import UIKit 是不够的 ——
+# PSListController 是私有类，必须自己声明。漏了会级联出：
+#   use of undeclared identifier '_specifiers'
+#   no visible @interface ... declares the selector 'reloadSpecifiers'
+# 共 19 个错误。而 Theos 只报第一个文件，看起来像"prefs 全烂了"。
+#
+# ⚠️⚠️ 本检查第一版是**无效的**（靠注入测试发现）：
+#    写的是 `"_specifiers" in pm_hdr` —— 子串匹配，而头文件**注释里**也提到
+#    _specifiers，于是恒为真、永远不报错。这正是 §54「子串匹配认错对象」。
+#    ✅ 正解：剥掉注释后，在 **@interface PSListController { ... } 块内**精确查找。
+pm_src = read("prefs/SMRootListController.m")
+pm_hdr = read("prefs/SMRootListController.h")
+hdr_nc = strip_comments(pm_hdr)          # ⭐ 必须先剥注释！
+
+bad = []
+if "@interface PSListController" not in hdr_nc:
+    bad.append("prefs/SMRootListController.h 缺少 @interface PSListController 声明")
+else:
+    # 精确取 PSListController 的 ivar 块（花括号内）
+    blk = re.search(r"@interface\s+PSListController\b[^{]*\{(.*?)\}", hdr_nc, re.S)
+    if not blk:
+        bad.append("PSListController 没有声明 ivar 块（{ ... }）")
+    elif not re.search(r"(?<![\w])_specifiers(?![\w])", blk.group(1)):
+        bad.append("PSListController 的 ivar 块里缺少 _specifiers"
+                   "（缺了会「能进面板但整页空白」，且不报错）")
+if "@interface PSSpecifier" not in hdr_nc:
+    bad.append("缺少 @interface PSSpecifier 声明")
+# .m 必须 import 自己那个头
+if '#import "SMRootListController.h"' not in pm_src:
+    bad.append('prefs/SMRootListController.m 没有 #import "SMRootListController.h"')
+# .m 用了这些符号 → 头文件里必须有声明
+src_nc = strip_comments(pm_src)
+for sym in ["_specifiers", "reloadSpecifiers", "loadSpecifiersFromPlistName"]:
+    if re.search(r"(?<![\w])" + re.escape(sym) + r"(?![\w])", src_nc) and \
+       not re.search(r"(?<![\w])" + re.escape(sym) + r"(?![\w])", hdr_nc):
+        bad.append("prefs/.m 用了 %s 但头文件里没有声明" % sym)
+if bad:
+    for b in bad:
+        fail("❌ " + b)
+else:
+    print("   ✅ PSListController 私有声明齐全（含 _specifiers ivar，已剥注释精确匹配）")
+
+# ---------------------------------------------------------------------------
+print("--- 检查 22：⭐ 调用的函数名必须真实存在（防「名字打错」隐式声明）---")
+# 血泪：我把 SMPrefsPluginVersionFromLog() 写成了 SMGPrefsPluginVersionFromLog()
+# （SMPrefs- vs SMG-），Clang 在 C99 下只报 warning + 隐式声明 int
+# → 配合 ARC 变成 4 个 error，全在别人看着莫名其妙的行上。
+# 做法：收集文件内所有函数定义名，再检查所有 `标识符(` 调用是否都有定义或外部声明。
+for path in ["prefs/SMRootListController.m", "SMGCommon.m", "Tweak.x"]:
+    src = strip_comments(read(path))
+    defined = set(re.findall(r"\n\s*(?:static\s+)?[\w\s\*<>]*?\b(\w+)\s*\([^;{]*\)\s*\{", src))
+    defined |= set(re.findall(r"@implementation\s+(\w+)", src))
+    # 本项目自定义前缀：SMG(插件端) / SMPrefs(面板端)
+    called = set(re.findall(r"(?<![\w.])(SMG|SMPrefs)([A-Z]\w*)\s*\(", src))
+    bad = []
+    for pre, rest in sorted(called):
+        name = pre + rest
+        if name in defined:
+            continue
+        # 允许：已在头文件里声明的导出符号（插件端）
+        if ("FOUNDATION_EXPORT" in read("SMGCommon.h")
+                and re.search(r"FOUNDATION_EXPORT[^;]*\b" + re.escape(name) + r"\s*\(", read("SMGCommon.h"))):
+            continue
+        # 面板端不得引用插件端符号（检查 9 已管），这里只报「谁都没定义」
+        bad.append(name)
+    if bad:
+        fail("❌ %s 里调用了未定义的函数（名字打错？）：" % path)
+        for b in sorted(set(bad)):
+            fail("     %s" % b)
+if not FAIL or True:
+    pass
+
+# ---------------------------------------------------------------------------
+print("--- 检查 23：⭐ 别把 integerValue 套两层 ---")
+# 血泪：`[[SMPrefsGet(k) ?: @3 integerValue] integerValue]`
+# 内层已返回 NSInteger，外层再发消息 → bad receiver type 'NSInteger'。
+for path in sorted(glob.glob("prefs/*.m")):
+    for i, line in enumerate(read(path).splitlines(), 1):
+        s = strip_comments(line)
+        if re.search(r"\?\:\s*@[\d.]+\s+integerValue\]\s*integerValue\]", s) or \
+           re.search(r"integerValue\]\s*integerValue\]", s):
+            fail("❌ %s 第 %d 行 integerValue 套了两层：%s" % (path, i, line.strip()))
+print("   ✅ 无 double-integerValue")
+
+# ---------------------------------------------------------------------------
 print()
 if FAIL:
     print("🛑 本地预检未通过，修完再推 CI")

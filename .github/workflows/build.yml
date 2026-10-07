@@ -412,6 +412,95 @@ jobs:
           print("✅ NSPrincipalClass 与实现类一致")
           PY
 
+          echo "--- 检查 21：⭐ prefs 侧必须声明 PSListController（否则 19 连错）---"
+          # 首轮 CI 血泪：prefs 只 import UIKit 不够 —— PSListController 是私有类，
+          # 必须自己声明，漏了会级联 19 个 error（_specifiers / reloadSpecifiers 认不出）。
+          # ⚠️ 本检查第一版无效：用子串 `in` 判断，而头文件注释里也提到 _specifiers
+          #    → 恒为真。必须**剥注释**后在 ivar 块内精确匹配（§54 子串匹配认错对象）。
+          python3 - <<'PY' || FAIL=1
+          import io, re, sys
+
+          def read(p):
+              return io.open(p, encoding='utf-8', errors='replace').read()
+
+          def strip_comments(s):
+              s = re.sub(r'/\*.*?\*/', '', s, flags=re.S)
+              return re.sub(r'//[^\n]*', '', s)
+
+          src = read('prefs/SMRootListController.m')
+          hdr = strip_comments(read('prefs/SMRootListController.h'))
+          bad = []
+
+          if '@interface PSListController' not in hdr:
+              bad.append('缺少 @interface PSListController 声明')
+          else:
+              blk = re.search(r'@interface\s+PSListController\b[^{]*\{(.*?)\}', hdr, re.S)
+              if not blk:
+                  bad.append('PSListController 没有 ivar 块 { ... }')
+              elif not re.search(r'(?<![\w])_specifiers(?![\w])', blk.group(1)):
+                  bad.append('PSListController 的 ivar 块缺少 _specifiers'
+                             '（缺了会「能进面板但整页空白」且不报错）')
+          if '@interface PSSpecifier' not in hdr:
+              bad.append('缺少 @interface PSSpecifier 声明')
+          if '#import "SMRootListController.h"' not in src:
+              bad.append('.m 没有 import 自己的头文件')
+
+          src_nc = strip_comments(src)
+          for sym in ['_specifiers', 'reloadSpecifiers', 'loadSpecifiersFromPlistName']:
+              if re.search(r'(?<![\w])' + re.escape(sym) + r'(?![\w])', src_nc) and \
+                 not re.search(r'(?<![\w])' + re.escape(sym) + r'(?![\w])', hdr):
+                  bad.append('.m 用了 %s 但头文件没声明' % sym)
+          if bad:
+              for b in bad:
+                  print('❌ ' + b)
+              sys.exit(1)
+          print('✅ PSListController 私有声明齐全（含 _specifiers ivar）')
+          PY
+
+          echo "--- 检查 22：⭐ 调用的函数必须真实存在（防名字打错→隐式声明）---"
+          python3 - <<'PY' || FAIL=1
+          import io, re, sys
+
+          def read(p):
+              return io.open(p, encoding='utf-8', errors='replace').read()
+
+          def strip_comments(s):
+              s = re.sub(r'/\*.*?\*/', '', s, flags=re.S)
+              return re.sub(r'//[^\n]*', '', s)
+
+          hdr_h = read('SMGCommon.h')
+          for path in ['prefs/SMRootListController.m', 'SMGCommon.m', 'Tweak.x']:
+              src = strip_comments(read(path))
+              defined = set(re.findall(
+                  r'\n\s*(?:static\s+)?[\w\s\*<>]*?\b(\w+)\s*\([^;{]*\)\s*\{', src))
+              defined |= set(re.findall(r'@implementation\s+(\w+)', src))
+              bad = []
+              for pre, rest in sorted(set(re.findall(r'(?<![\w.])(SMG|SMPrefs)([A-Z]\w*)\s*\(', src))):
+                  name = pre + rest
+                  if name in defined:
+                      continue
+                  if re.search(r'FOUNDATION_EXPORT[^;]*\b' + re.escape(name) + r'\s*\(', hdr_h):
+                      continue
+                  bad.append(name)
+              if bad:
+                  print('❌ %s 调用了未定义的函数（名字打错？）：' % path)
+                  for b in sorted(set(bad)):
+                      print('     %s' % b)
+                  sys.exit(1)
+          print('✅ 所有 SMG*/SMPrefs* 调用都有定义')
+          PY
+
+          echo "--- 检查 23：⭐ integerValue 不能套两层 ---"
+          python3 - <<'PY' || FAIL=1
+          import io, re, sys, glob
+          for path in sorted(glob.glob('prefs/*.m')):
+              for i, line in enumerate(io.open(path, encoding='utf-8', errors='replace'), 1):
+                  if re.search(r'integerValue\]\s*integerValue\]', line):
+                      print('❌ %s 第 %d 行 integerValue 套两层' % (path, i))
+                      sys.exit(1)
+          print('✅ 无 double-integerValue')
+          PY
+
           if [ "$FAIL" -ne 0 ]; then
             echo ""
             echo "🛑 静态自检未通过，拒绝继续编译"

@@ -1,6 +1,7 @@
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 #import <notify.h>
+#import "SMRootListController.h"
 
 // ===========================================================================
 // 安全模式卫士 · 设置面板（PreferenceBundle 侧）
@@ -141,9 +142,6 @@ static NSString *SMPrefsPluginVersionFromLog(void) {
 
 #pragma mark - 控制器
 
-@interface SMRootListController : PSListController
-@end
-
 // ⭐ C 函数必须在 @implementation **之前**声明 ——
 //    （技能库 §42：类方法必须在 @implementation 里面，而 C 函数反过来要先声明）
 static void SMRootListControllerPrefsChanged(CFNotificationCenterRef center,
@@ -190,7 +188,10 @@ static void SMRootListControllerPrefsChanged(CFNotificationCenterRef center,
     @try {
         NSInteger fails = SMPrefsIntFromFile(@"_failcount.txt", 0);
         NSInteger total = SMPrefsIntFromFile(@"_boottotal.txt", 0);
-        NSInteger maxN  = [[SMPrefsGet(@"maxFailCount") ?: @3 integerValue] integerValue];
+        // ⚠️ 别套两层 integerValue：SMGPrefsGet 返回 id，
+        //    `SMPrefsGet(...) ?: @3` 已是 id，再发一次 integerValue 到 NSInteger 上就类型错乱。
+        id rawMax = SMPrefsGet(@"maxFailCount");
+        NSInteger maxN = rawMax ? [rawMax integerValue] : 3;
         BOOL sm = SMPrefsSafeModeFlagExists();
 
         NSString *state = sm ? @"🔴 已写入安全模式标记" : @"🟢 正常";
@@ -201,7 +202,7 @@ static void SMRootListControllerPrefsChanged(CFNotificationCenterRef center,
 
 - (id)readVersionDiag:(PSSpecifier *)spec {
     @try {
-        NSString *pluginVer = SMGPrefsPluginVersionFromLog();
+        NSString *pluginVer = SMPrefsPluginVersionFromLog();
         if (!pluginVer) {
             return [NSString stringWithFormat:
                 @"面板版本：%@\n插件版本：（日志里找不到启动横幅）\n\n⚠️ 这说明插件本体没有在 SpringBoard 里加载过。\n请确认：① 已安装主插件包；② 已重启桌面。",
