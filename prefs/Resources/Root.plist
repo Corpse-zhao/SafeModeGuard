@@ -1,0 +1,82 @@
+{
+    items = (
+        {
+            cell = PSGroupSpecifier;
+            label = "安全模式卫士";
+            footerText = "防止插件导致「无限注销 / 黑屏」把设备卡死。\n\n原理：插件在磁盘上记录每次桌面启动。如果连续多次启动都没能存活到确认点（默认 30 秒），就判定设备已陷入无限注销循环，自动写入 ElleKit 安全模式标记 —— 下次重启会跳过全部插件注入，让你能进系统卸载问题插件。";
+        },
+        {
+            cell = PSSwitchCell;
+            key = "enabled";
+            label = "启用保护";
+            default = true;
+            defaultSet = true;
+            get = "getEnabledPref:";
+            set = "setEnabledPref:specifier:";
+            footerText = "关闭后插件不再记账、也不会自动进安全模式。仅在排查问题时临时关闭。";
+        },
+        {
+            cell = PSGroupSpecifier;
+            label = "当前状态";
+        },
+        {
+            cell = PSStaticTextCell;
+            label = "状态";
+            get = "readStateSummary:";
+        },
+        {
+            cell = PSLinkCell;
+            label = "查看运行日志";
+            action = "smgShowLog";
+        },
+        {
+            cell = PSLinkCell;
+            label = "清空运行日志";
+            action = "smgClearLog";
+        },
+        {
+            cell = PSGroupSpecifier;
+            label = "安全模式";
+            footerText = "「进入安全模式」= 写入 /var/mobile/.eksafemode，下次重启时 ElleKit 会跳过全部插件注入，设备以「无插件」状态启动。\n\n⚠️ 必须重启（注销不够）才会生效。\n\n进入安全模式后，你可以打开 Sileo 卸载有问题的插件；问题解决后回到本页面点「退出安全模式」，再重启即可。";
+        },
+        {
+            cell = PSLinkCell;
+            label = "进入安全模式（写入标记）";
+            action = "smgEnterSafeMode";
+        },
+        {
+            cell = PSLinkCell;
+            label = "退出安全模式（删除标记）";
+            action = "smgExitSafeMode";
+        },
+        {
+            cell = PSGroupSpecifier;
+            label = "维护";
+            footerText = "重置只清空「记账数据」，不影响安全模式标记本身。\n\n如果你刚经历一次误判，或者想重新从零开始观察，可以点重置。";
+        },
+        {
+            cell = PSLinkCell;
+            label = "重置启动计数与历史";
+            action = "smgResetState";
+        },
+        {
+            cell = PSGroupSpecifier;
+            label = "版本自检";
+            footerText = "比对设置面板与本体的版本号。两者不一致 = 插件本体没有加载（你看到的面板是旧的，或主包没装上），此时保护功能实际未生效。";
+        },
+        {
+            cell = PSStaticTextCell;
+            label = "版本";
+            get = "readVersionDiag:";
+        },
+        {
+            cell = PSGroupSpecifier;
+            label = "最近启动记录";
+        },
+        {
+            cell = PSStaticTextCell;
+            label = "记录";
+            get = "readBootHistory:";
+        }
+    );
+}

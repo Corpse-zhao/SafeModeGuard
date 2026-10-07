@@ -1,0 +1,10 @@
+{
+    entry = {
+        bundle = "SafeModeGuardPrefs";
+        cell = "PSLinkCell";
+        detail = "SMRootListController";
+        icon = "icon.png";
+        isController = true;
+        label = "安全模式卫士";
+    };
+}

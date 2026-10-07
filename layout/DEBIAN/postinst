@@ -1,0 +1,14 @@
+#!/bin/bash
+# 安全模式卫士 postinst
+# 预建共享目录并放开权限，使 SpringBoard 与「设置」进程都能读写
+DIR="/var/mobile/Documents/安全模式卫士"
+mkdir -p "$DIR"
+chmod 777 "$DIR"
+chown mobile:mobile "$DIR" 2>/dev/null || true
+
+# ⚠️ 不清除 _bootlog.txt：升级时保留启动历史，
+#    否则「升级 → 无限注销 → 升级」会让计数从头开始，永远攒不满阈值。
+# 只清掉上一版可能残留的"本轮未销号"标记，避免升级本身被误判成异常启动。
+rm -f "$DIR/_current.txt" 2>/dev/null || true
+
+exit 0

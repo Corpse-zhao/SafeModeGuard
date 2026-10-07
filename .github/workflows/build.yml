@@ -1,0 +1,507 @@
+name: Build SafeModeGuard
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install toolchain
+        run: |
+          brew install make xz ldid
+
+      - name: Setup Theos (roothide 分支)
+        run: |
+          export THEOS=$HOME/theos
+          # ⚠️ 必须用 roothide/theos：官方 theos 没有 roothide package scheme，
+          #    会报 "'roothide' package scheme does not exist"
+          git clone --recursive https://github.com/roothide/theos.git $THEOS
+          git clone --depth 1 --filter=blob:none --sparse \
+            https://github.com/theos/sdks.git $THEOS/sdks-tmp
+          cd $THEOS/sdks-tmp
+          git sparse-checkout set iPhoneOS14.5.sdk
+          mv iPhoneOS14.5.sdk $THEOS/sdks/
+          rm -rf $THEOS/sdks-tmp
+          ls $THEOS/sdks/
+          ls $THEOS/vendor/mod/
+          echo "THEOS=$THEOS" >> $GITHUB_ENV
+          echo "$THEOS/bin" >> $GITHUB_PATH
+
+      # ⚠️ Preflight 必须排在 Build 之前：编译一挂就会被 skipped，看不到自检结论。
+      - name: Preflight — 静态自检
+        run: |
+          FAIL=0
+
+          echo "--- 检查 1：%hook 类必须真实存在（本插件不用 %hook，有则报警）---"
+          # 本项目是纯记账逻辑，不需要 hook 任何方法。
+          # 一旦有人为了「检测黑屏」去 %hook 私有类，就是重演 DecoyLock 的静默死代码问题。
+          if grep -nE '^%hook[[:space:]]' Tweak.x; then
+            echo "❌ Tweak.x 出现了 %hook。本插件设计上不需要 hook 任何方法 ——"
+            echo "   任何 %hook 私有类都有「类不存在 → Logos 静默丢弃」的风险，请说明理由。"
+            FAIL=1
+          else
+            echo "✅ 无 %hook（纯记账逻辑，不存在静默死代码风险）"
+          fi
+
+          echo "--- 检查 2：主插件禁止自建窗口 / 抢 key window ---"
+          # 技能库 §48 血泪：自建窗口调 makeKeyAndVisible 会抢走锁屏 key window，
+          # 用户表现为「界面看得见但点不动」，设备近乎瘫痪。
+          if grep -vE '^[[:space:]]*(//|\*|/\*)' Tweak.x SMGCommon.m \
+               | grep -nE 'makeKeyAndVisible|UIWindow[[:space:]]*\*|addSubview'; then
+            echo "❌ 检测到窗口操作。本插件是纯后台逻辑，绝不允许碰界面。"
+            FAIL=1
+          else
+            echo "✅ 主插件无任何界面操作（纯后台记账）"
+          fi
+
+          echo "--- 检查 3：⭐ 记账必须发生在 %ctor 顶层，不能藏在延迟回调里 ---"
+          # 本插件的全部价值 = 「起来又死掉」这个事实能落到磁盘上。
+          # 如果把记账放进 dispatch_after，SpringBoard 在延迟期间被杀 → 没记账 → 漏判。
+          python3 - <<'PY' || FAIL=1
+          import io, re, sys
+          t = io.open('Tweak.x', encoding='utf-8', errors='replace').read()
+          m = re.search(r'%ctor\s*\{(.*?)\n\}', t, re.S)
+          if not m:
+              print("❌ 找不到 %ctor 块"); sys.exit(1)
+          body = m.group(1)
+          # 剥注释
+          body_nc = re.sub(r'//[^\n]*', '', body)
+          body_nc = re.sub(r'/\*.*?\*/', '', body_nc, flags=re.S)
+
+          if 'SMGBoot()' not in body_nc:
+              print("❌ %ctor 里没有调用 SMGBoot() → 记账根本不会发生"); sys.exit(1)
+          # 确认 SMGBoot 是同步调用的（在 dispatch_after 外面）
+          # 做法：去掉 dispatch_after 的整块，再看 SMGBoot 是否还在
+          stripped = re.sub(r'dispatch_after\s*\((?:[^()]|\([^()]*\))*\)\s*;', '', body_nc)
+          if 'SMGBoot()' not in stripped:
+              print("❌ SMGBoot() 只出现在 dispatch_after 里面 → 记账被延迟了，会漏判"); sys.exit(1)
+          print("✅ 记账在 %ctor 顶层同步执行（跳过了 dispatch_after 剥离测试）")
+          PY
+
+          echo "--- 检查 4：⭐ 记账（写 pending）必须在任何延迟之前 ---"
+          # SMGBoot 内部：SMGBootBegin() 必须在 dispatch_after 之前被调用
+          python3 - <<'PY' || FAIL=1
+          import io, re, sys
+          t = io.open('Tweak.x', encoding='utf-8', errors='replace').read()
+          m = re.search(r'static void SMGBoot\(void\)\s*\{(.*?)\n\}', t, re.S)
+          if not m:
+              print("❌ 找不到 SMGBoot 函数体"); sys.exit(1)
+          body = re.sub(r'//[^\n]*', '', m.group(1))
+          i_begin = body.find('SMGBootBegin()')
+          i_delay = body.find('dispatch_after')
+          if i_begin < 0:
+              print("❌ SMGBoot 里没有 SMGBootBegin()（没记账）"); sys.exit(1)
+          if i_delay >= 0 and i_begin > i_delay:
+              print("❌ SMGBootBegin() 排在 dispatch_after 之后 → 记账被延迟，会漏判"); sys.exit(1)
+          print("✅ 记账先于延迟执行")
+          PY
+
+          echo "--- 检查 5：⭐⭐ 存活确认必须「先验证界面再销号」，不能裸延迟销号 ---"
+          # 如果只是「等 N 秒然后销号」，SpringBoard 在 N-1 秒被杀也会销号 → 漏判。
+          python3 - <<'PY' || FAIL=1
+          import io, re, sys
+          t = io.open('Tweak.x', encoding='utf-8', errors='replace').read()
+          t = re.sub(r'//[^\n]*', '', t)
+          t = re.sub(r'/\*.*?\*/', '', t, flags=re.S)
+
+          if 'SMGSystemLooksAlive' not in t:
+              print("❌ 缺少 SMGSystemLooksAlive → 没有「界面是否就绪」的判定"); sys.exit(1)
+          # 销号前必须有 alive 判定
+          m = re.search(r'static void SMGAliveRound\(void\)\s*\{(.*?)\n\}', t, re.S)
+          if not m:
+              print("❌ 找不到 SMGAliveRound"); sys.exit(1)
+          body = m.group(1)
+          if 'SMGSystemLooksAlive()' not in body:
+              print("❌ SMGAliveRound 里没有调用 SMGSystemLooksAlive()"); sys.exit(1)
+          # SMGBootConfirmAlive 必须出现在 if (alive) 分支里
+          if not re.search(r'if\s*\(\s*alive\s*\)\s*\{[^}]*SMGBootConfirmAlive\(\)', body, re.S):
+              print("❌ SMGBootConfirmAlive() 不在 if (alive) 分支里 → 会裸销号，漏判"); sys.exit(1)
+          # 超时分支必须**不**销号
+          m2 = re.search(r'elapsed\s*>=\s*limit\s*\)?\s*\{(.*?)\n\s*\}', body, re.S)
+          if m2 and 'SMGBootConfirmAlive' in m2.group(1):
+              print("❌ 超时分支里调用了 SMGBootConfirmAlive() → 超时反而销号，保护彻底失效"); sys.exit(1)
+          print("✅ 存活确认=先验证界面；超时不销号")
+          PY
+
+          echo "--- 检查 6：⭐⭐ 磁盘 IO 必须全部包 @try（不能因 IO 问题拖垮 SpringBoard）---"
+          python3 - <<'PY' || FAIL=1
+          import io, re, sys
+          for path in ['SMGCommon.m']:
+              src = io.open(path, encoding='utf-8', errors='replace').read()
+              # 找出所有函数体，检查含磁盘操作的函数是否有 @try
+              bad = []
+              for m in re.finditer(r'\n(?:static\s+)?[\w\s\*<>]*?(\w+)\s*\([^;{]*\)\s*\{(.*?)\n\}', src, re.S):
+                  name, body = m.group(1), m.group(2)
+                  if not re.search(r'writeToFile|removeItemAtPath|contentsOfFile|createDirectoryAtPath|fileHandleForWriting|setAttributes', body):
+                      continue
+                  if '@try' not in body:
+                      bad.append(name)
+              if bad:
+                  print("❌ 以下函数含磁盘操作但没有 @try 保护：")
+                  for n in sorted(set(bad)):
+                      print("     - %s" % n)
+                  sys.exit(1)
+              print("✅ %s：含磁盘操作的函数都有 @try" % path)
+          PY
+
+          echo "--- 检查 7：⭐ 写入必须原子（避免半截文件被下一轮读成垃圾）---"
+          if grep -qE 'writeToFile:[^;]*atomically:YES' SMGCommon.m; then
+            echo "✅ 使用了原子写"
+          else
+            echo "❌ 未检测到原子写 —— 写一半被杀会留下损坏文件，下一轮解析出垃圾值"
+            FAIL=1
+          fi
+
+          echo "--- 检查 8：⭐ 必须使用 ElleKit 官方安全模式标记路径 ---"
+          # ElleKit libinjector：以下任一成立则跳过全部常规插件注入
+          #   ① _MSSafeMode=1  ② _SafeMode=1  ③ /var/mobile/.eksafemode 存在
+          # 我们用③。路径写错 = 插件"看起来在工作"但完全没保护作用。
+          if ! grep -qE '"/var/mobile/\.eksafemode"' SMGCommon.h SMGCommon.m; then
+            echo "❌ 找不到 ElleKit 官方标记路径 /var/mobile/.eksafemode"
+            echo "   路径写错的话，插件会「看起来正常但毫无保护作用」"
+            FAIL=1
+          else
+            echo "✅ 使用 ElleKit 官方标记 /var/mobile/.eksafemode"
+          fi
+
+          echo "--- 检查 9：⭐ prefs 侧禁止调用插件端符号（跨目标符号隔离）---"
+          # prefs 是独立二进制、不加载插件 dylib。调用插件端 FOUNDATION_EXPORT 函数
+          # 能编译过（LDFLAGS 有 dynamic_lookup），但装到手机上一调用就崩。
+          python3 - <<'PY' || FAIL=1
+          import io, re, sys, glob
+          h = io.open('SMGCommon.h', encoding='utf-8', errors='replace').read()
+          exported = set(re.findall(r'FOUNDATION_EXPORT\s+[\w\s\*<>]*?\b(\w+)\s*\(', h))
+          print("   插件端导出符号 %d 个" % len(exported))
+          bad = []
+          for p in glob.glob('prefs/*.m') + glob.glob('prefs/*.h'):
+              src = io.open(p, encoding='utf-8', errors='replace').read()
+              src = re.sub(r'//[^\n]*', '', src)
+              for sym in sorted(exported):
+                  if re.search(r'(?<![\w])' + re.escape(sym) + r'\s*\(', src):
+                      # 允许同名前缀差异：SMGPrefs* 是本文件自己实现的
+                      bad.append((p, sym))
+          if bad:
+              print("❌ prefs 侧调用了插件端符号（装机即崩）：")
+              for p, s in bad:
+                  print("     %s → %s" % (p, s))
+              sys.exit(1)
+          print("✅ prefs 侧未调用任何插件端符号（符号隔离正确）")
+          PY
+
+          echo "--- 检查 10：⭐ Root.plist 的 action 必须在设置页类里真有实现 ---"
+          # Preferences 框架对「action 写错/没实现」不报任何错，只表现「点了没反应」。
+          python3 - <<'PY' || FAIL=1
+          import io, re, sys
+          p = io.open('prefs/Resources/Root.plist', encoding='utf-8', errors='replace').read()
+          m = io.open('prefs/SMRootListController.m', encoding='utf-8', errors='replace').read()
+          actions = set(re.findall(r'"action"\s*:\s*"([^"]+)"', p))
+          code = re.sub(r'//[^\n]*', '', m)
+          methods = set(re.findall(r'^\s*-\s*\([^)]*\)\s*([A-Za-z_][A-Za-z0-9_]*)', code, re.M))
+          bad = [a for a in sorted(actions) if a.split(':')[0] not in methods]
+          if bad:
+              print("❌ Root.plist 里这些 action 没有实现：")
+              for a in bad:
+                  print("     - %s" % a)
+              sys.exit(1)
+          print("✅ plist action 全部有实现（%d 个）" % len(actions))
+          PY
+
+          echo "--- 检查 11：⭐ Root.plist 的 get 也必须有实现（同款静默失败）---"
+          python3 - <<'PY' || FAIL=1
+          import io, re, sys
+          p = io.open('prefs/Resources/Root.plist', encoding='utf-8', errors='replace').read()
+          m = io.open('prefs/SMRootListController.m', encoding='utf-8', errors='replace').read()
+          gets = set(re.findall(r'"get"\s*:\s*"([^"]+)"', p))
+          sets = set(re.findall(r'"set"\s*:\s*"([^"]+)"', p))
+          code = re.sub(r'//[^\n]*', '', m)
+          methods = set(re.findall(r'^\s*-\s*\([^)]*\)\s*([A-Za-z_][A-Za-z0-9_]*)', code, re.M))
+          bad = []
+          for g in sorted(gets):
+              if g.split(':')[0] not in methods: bad.append(("get", g))
+          # set 是 "setEnabledPref:specifier:" 形式，取第一段
+          for s in sorted(sets):
+              if s.split(':')[0] not in methods: bad.append(("set", s))
+          if bad:
+              print("❌ Root.plist 里的 get/set 没有实现：")
+              for k, v in bad: print("     %s → %s" % (k, v))
+              sys.exit(1)
+          print("✅ plist get/set 全部有实现")
+          PY
+
+          echo "--- 检查 12：日志格式串里的字面 % 必须写成 %% ---"
+          # DLProbe/SMGLog 声明为 NS_FORMAT_FUNCTION → 编译器按 printf 校验。
+          # 文案里写 %hook / %orig 这类字面量会被当成转换符 → -Werror 直接挂。
+          python3 - <<'PY' || FAIL=1
+          import glob, re, sys
+          files = ["Tweak.x", "SMGCommon.m"] + glob.glob("prefs/*.m")
+          call = re.compile(r'(?:SMGLog|SMPrefsLog)\s*\(\s*@"((?:[^"\\]|\\.)*)"')
+          conv = re.compile(r'%[-+ #0-9.*]*[lhqzjt]*[diouxXeEfgGaAcspn@]')
+          bad = []
+          for f in files:
+              try:
+                  src = open(f, encoding="utf-8").read()
+              except FileNotFoundError:
+                  continue
+              for i, line in enumerate(src.splitlines(), 1):
+                  m = call.search(line)
+                  if not m: continue
+                  s = m.group(1).replace("%%", "\x00")
+                  for mm in conv.finditer(s):
+                      nxt = s[mm.end():mm.end()+2]
+                      if len(nxt) == 2 and all(c.isascii() and c.isalpha() for c in nxt):
+                          bad.append((f, i, m.group(1))); break
+                  else:
+                      rest = conv.sub("", s)
+                      if "%" in rest: bad.append((f, i, m.group(1)))
+          if bad:
+              print("❌ 以下日志格式串的 % 未正确转义：")
+              for f, i, s in bad: print("   %s:%d  %s" % (f, i, s))
+              sys.exit(1)
+          print("✅ 日志格式串检查通过")
+          PY
+
+          echo "--- 检查 13：同一类不能有多个 %hook 块（本项目应为 0）---"
+          DUP=$(grep -oE '^%hook[[:space:]]+[A-Za-z_][A-Za-z0-9_]*' Tweak.x | awk '{print $2}' | sort | uniq -d)
+          if [ -n "$DUP" ]; then
+            echo "❌ 重复 %hook 类：$DUP"
+            FAIL=1
+          else
+            echo "✅ 无重复 %hook 类"
+          fi
+
+          echo "--- 检查 14：文件作用域 static 变量禁止「声明了却没用」（-Werror）---"
+          python3 - <<'PY' || FAIL=1
+          import io, re, sys, glob
+          bad = 0
+          for path in sorted(glob.glob('*.m') + glob.glob('prefs/*.m')):
+              raw = io.open(path, encoding='utf-8', errors='replace').read()
+              t = re.sub(r'/\*.*?\*/', '', raw, flags=re.S)
+              t = re.sub(r'//[^\n]*', '', t)
+              t = re.sub(r'"(?:\\.|[^"\\])*"', '""', t)
+              lines = t.splitlines()
+              for i, l in enumerate(lines, 1):
+                  if not l or l[0].isspace(): continue
+                  m = re.match(r'static\s+(?:const\s+)?.*?\b(\w+)\s*(?:=[^;]*)?;\s*$', l)
+                  if not m: continue
+                  if '(' in l and '=' not in l: continue
+                  name = m.group(1)
+                  pat = re.compile(r'(?<![\w])' + re.escape(name) + r'(?![\w])')
+                  if not any(j != i and pat.search(o) for j, o in enumerate(lines, 1)):
+                      print("❌ %s 第 %d 行的 static 变量 `%s` 声明后从未使用" % (path, i, name))
+                      bad = 1
+          if bad: sys.exit(1)
+          print("✅ 无「声明了却没用」的 static 变量")
+          PY
+
+          echo "--- 检查 15：ARC 桥接（ObjC 指针当 C 指针用必须 __bridge）---"
+          python3 - <<'PY' || FAIL=1
+          import io, re, sys, glob
+          bad = 0
+          for path in sorted(glob.glob('*.m') + glob.glob('*.x') + glob.glob('prefs/*.m')):
+              for i, line in enumerate(io.open(path, encoding='utf-8', errors='replace'), 1):
+                  if '__bridge' in line: continue
+                  s = line.strip()
+                  if s.startswith('//') or s.startswith('*') or s.startswith('/*'): continue
+                  for m in re.finditer(r'\(\s*void\s*\*\s*\)\s*([A-Za-z_]\w*)', line):
+                      t = m.group(1)
+                      if t.startswith('&'): continue
+                      if re.match(r'^(old|orig|imp)$', t, re.I): continue
+                      print("❌ %s 第 %d 行：`(void *)%s` 需要 __bridge" % (path, i, t))
+                      bad = 1
+          if bad: sys.exit(1)
+          print("✅ ARC 桥接正确")
+          PY
+
+          echo "--- 检查 16：⭐ 插件与面板的版本号必须一致 ---"
+          python3 - <<'PY' || FAIL=1
+          import io, re, sys
+          h = io.open('SMGCommon.h', encoding='utf-8', errors='replace').read()
+          m = re.search(r'#define\s+SMG_VERSION\s+@"([^"]+)"', h)
+          if not m:
+              print("❌ SMGCommon.h 找不到 SMG_VERSION"); sys.exit(1)
+          ver = m.group(1)
+          print("   插件版本 = %s" % ver)
+
+          # prefs 侧自定版本常量必须一致
+          pm = io.open('prefs/SMRootListController.m', encoding='utf-8', errors='replace').read()
+          m2 = re.search(r'kSMGPrefsVersion\s*=\s*@"([^"]+)"', pm)
+          if not m2:
+              print("❌ prefs 侧找不到 kSMGPrefsVersion"); sys.exit(1)
+          if m2.group(1) != ver:
+              print("❌ 面板版本(%s) ≠ 插件版本(%s) → 版本自检会永远报「不一致」" % (m2.group(1), ver))
+              sys.exit(1)
+
+          # control / Info.plist 也要同步
+          for path, pat, label in [
+              ('control', r'^Version:\s*(\S+)', '主包 control'),
+              ('prefs/control', r'^Version:\s*(\S+)', '面板 control'),
+              ('prefs/Resources/Info.plist', r'CFBundleShortVersionString\s*=\s*"([^"]+)"', '面板 Info.plist'),
+          ]:
+              txt = io.open(path, encoding='utf-8', errors='replace').read()
+              mm = re.search(pat, txt, re.M)
+              if not mm:
+                  print("❌ %s 里找不到版本号" % label); sys.exit(1)
+              if mm.group(1) != ver:
+                  print("❌ %s 版本(%s) ≠ SMG_VERSION(%s)" % (label, mm.group(1), ver))
+                  sys.exit(1)
+
+          print("✅ 四处版本号全部一致（%s）" % ver)
+          PY
+
+          echo "--- 检查 17：⭐ 启动横幅必须用 %@ + SMG_VERSION（单一来源）---"
+          if grep -qE 'SafeModeGuard %@ 启动' Tweak.x; then
+            echo "✅ 启动横幅使用 SMG_VERSION 单一来源"
+          else
+            echo "❌ 启动横幅没写成 'SafeModeGuard %@ 启动' 形式"
+            echo "   （面板的版本自检靠解析这行，格式必须固定）"
+            FAIL=1
+          fi
+
+          echo "--- 检查 18：⭐ plist 结构检查（ASCII 老式 plist，禁用 plistlib）---"
+          # ⚠️ 教训：Theos 工程的 plist 是 NeXTSTEP/ASCII 老式格式，plistlib 只认
+          #    XML / 二进制 → 拿 plistlib 校验会 4 个文件全部误报 "Invalid file"，
+          #    看起来像"plist 全坏了"，实际是工具选错了。
+          #    正确做法：括号配平 + 必需键存在。
+          python3 - <<'PY' || FAIL=1
+          import io, re, sys
+
+          def read(p):
+              return io.open(p, encoding='utf-8', errors='replace').read()
+
+          def check(path, required):
+              s = read(path)
+              if not s.strip():
+                  print("❌ %s 是空文件" % path); return 1
+              t = re.sub(r'"(?:\\.|[^"\\])*"', '""', s)
+              for op, cl, name in [("{", "}", "花括号"), ("(", ")", "圆括号")]:
+                  if t.count(op) != t.count(cl):
+                      print("❌ %s 的%s不平衡：%d vs %d" % (path, name, t.count(op), t.count(cl)))
+                      return 1
+              for k in required:
+                  if not re.search(r'(?<![\w])' + re.escape(k) + r'(?![\w])', s):
+                      print("❌ %s 缺少必需键 %s" % (path, k)); return 1
+              return 0
+
+          bad = 0
+          bad |= check('prefs/Resources/Root.plist', ['items', 'cell', 'label'])
+          bad |= check('prefs/Resources/Info.plist',
+                       ['CFBundleExecutable', 'CFBundleIdentifier', 'NSPrincipalClass'])
+          bad |= check('SafeModeGuard.plist', ['Filter', 'Bundles'])
+          bad |= check('layout/Library/PreferenceLoader/Preferences/SafeModeGuard.plist',
+                       ['entry', 'bundle', 'cell', 'detail', 'isController', 'label'])
+          if bad:
+              sys.exit(1)
+          print("✅ 全部 plist 结构检查通过")
+
+          # NSPrincipalClass 必须与实现类同名
+          ip = read('prefs/Resources/Info.plist')
+          m = re.search(r'NSPrincipalClass\s*=\s*"?([A-Za-z_]\w*)', ip)
+          m2 = read('prefs/SMRootListController.m')
+          if not m:
+              print("❌ Info.plist 找不到 NSPrincipalClass"); sys.exit(1)
+          if ('@implementation ' + m.group(1)) not in m2:
+              print("❌ NSPrincipalClass=%s 与实现类不一致" % m.group(1)); sys.exit(1)
+          print("✅ NSPrincipalClass 与实现类一致")
+          PY
+
+          if [ "$FAIL" -ne 0 ]; then
+            echo ""
+            echo "🛑 静态自检未通过，拒绝继续编译"
+            exit 1
+          fi
+          echo "✅ 静态自检全部通过"
+
+      - name: Build package
+        run: |
+          export THEOS=$HOME/theos
+          # ⚠️ 不要接 `| tail -60`：会吞掉 make 的退出码，scheme 报错也显示 success
+          gmake package THEOS_PACKAGE_SCHEME=roothide FINALPACKAGE=1
+          ls -la packages/
+
+      - name: Inspect package contents
+        run: |
+          python3 - <<'PY'
+          import glob, io, tarfile
+          for path in sorted(glob.glob("packages/*.deb")):
+              print("==>", path)
+              raw = open(path, "rb").read()
+              off, data_tar = 8, None
+              while off < len(raw):
+                  hdr = raw[off:off+60]
+                  if len(hdr) < 60: break
+                  name = hdr[0:16].decode(errors="ignore").strip()
+                  try:
+                      size = int(hdr[48:58].decode(errors="ignore").strip())
+                  except Exception:
+                      break
+                  off += 60
+                  body = raw[off:off+size]; off += size + (size % 2)
+                  if name.startswith("data.tar"): data_tar = body
+              if data_tar:
+                  try:
+                      with tarfile.open(fileobj=io.BytesIO(data_tar)) as tf:
+                          for n in sorted(tf.getnames()):
+                              if not n.endswith("/"): print("   ", n)
+                  except Exception as e:
+                      print("   [!] tar read failed:", e)
+          PY
+
+      - name: Diagnose Mach-O slices
+        run: |
+          python3 - <<'PY'
+          import glob, io, tarfile, struct, os
+          def slices(b):
+              out = []
+              if b[:4] == b"\xca\xfe\xba\xbe":
+                  n = struct.unpack(">I", b[4:8])[0]
+                  off = 8
+                  for _ in range(n):
+                      ct, cs, o, sz, al = struct.unpack(">IIIII", b[off:off+20]); off += 20
+                      out.append((hex(ct), hex(cs), sz))
+              elif b[:4] == b"\xcf\xfa\xed\xfe":
+                  ct, cs = struct.unpack("<ii", b[4:12])
+                  out.append((hex(ct & 0xffffffff), hex(cs & 0xffffffff), len(b)))
+              return out
+          for path in sorted(glob.glob("packages/*.deb")):
+              raw = open(path, "rb").read()
+              off, data_tar = 8, None
+              while off < len(raw):
+                  hdr = raw[off:off+60]
+                  if len(hdr) < 60: break
+                  name = hdr[0:16].decode(errors="ignore").strip()
+                  try: size = int(hdr[48:58].decode(errors="ignore").strip())
+                  except Exception: break
+                  off += 60
+                  body = raw[off:off+size]; off += size + (size % 2)
+                  if name.startswith("data.tar"): data_tar = body
+              if not data_tar: continue
+              try:
+                  with tarfile.open(fileobj=io.BytesIO(data_tar)) as tf:
+                      for m in tf.getmembers():
+                          if m.isfile() and m.name.endswith(".dylib"):
+                              b = tf.extractfile(m).read()
+                              print(m.name, os.path.getsize(path), slices(b))
+              except Exception as e:
+                  print("[!] ", e)
+          PY
+        continue-on-error: true
+
+      - name: Show control
+        run: |
+          for p in packages/*.deb; do echo "== $p"; dpkg-deb -f "$p" 2>/dev/null || true; done
+        continue-on-error: true
+
+      - name: Upload .deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: SafeModeGuard-deb
+          path: packages/*.deb
+          if-no-files-found: error

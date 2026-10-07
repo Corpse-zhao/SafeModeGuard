@@ -1,0 +1,12 @@
+{
+    CFBundleDevelopmentRegion = "zh_CN";
+    CFBundleExecutable = "SafeModeGuardPrefs";
+    CFBundleIdentifier = "com.blr.safemodeguard.prefs";
+    CFBundleInfoDictionaryVersion = "6.0";
+    CFBundleName = "SafeModeGuardPrefs";
+    CFBundlePackageType = "BNDL";
+    CFBundleShortVersionString = "0.1.0";
+    CFBundleVersion = "0.1.0";
+    CFBundleDisplayName = "安全模式卫士设置";
+    NSPrincipalClass = "SMRootListController";
+}
