@@ -508,6 +508,19 @@ jobs:
           fi
           echo "✅ 静态自检全部通过"
 
+      # ⚠️ 修复：Windows 上 git 不记录可执行位 → DEBIAN 维护脚本克隆下来是 644
+      #    → 编译全过但倒在最后打包：
+      #      ERROR: maintainer script 'postinst' has bad permissions 644
+      #    ⭐ 这里 chmod 是**兜底**；正确做法是仓库里就存成 100755
+      #      （git update-index --chmod=+x layout/DEBIAN/postinst）
+      #      只在本机 chmod 文件不够，必须改 git 索引。
+      - name: Fix maintainer script permissions
+        run: |
+          if [ -d layout/DEBIAN ]; then
+            chmod 0755 layout/DEBIAN/* 2>/dev/null || true
+            ls -l layout/DEBIAN/
+          fi
+
       - name: Build package
         run: |
           export THEOS=$HOME/theos

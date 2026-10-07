@@ -454,6 +454,64 @@ for path in sorted(glob.glob("prefs/*.m")):
 print("   ✅ 无 double-integerValue")
 
 # ---------------------------------------------------------------------------
+print("--- 检查 24：⭐ DEBIAN 维护脚本必须可执行（否则打包阶段才失败）---")
+# 血泪（2026-10-07 第二轮 CI）：编译全部通过（双切片链接签名正常），
+# 却倒在最后打包：
+#   ERROR: maintainer script 'postinst' has bad permissions 644
+#   (must be >=0555 and <=0775)
+# 根因：Windows 上 git 不记录可执行位，CI 克隆下来是 644。
+# ⚠️ 只 chmod 本地文件**不够** —— 必须更新 **git 索引**里的权限位
+#    （`git update-index --chmod=+x`），否则推上去还是 644。
+#
+# ⚠️⚠️ 另一个坑（本检查第一版就踩了）：**在 Windows 上 os.stat() 报的权限位不可信**。
+#    Git Bash / MSYS 下新建文件恒被报成 666，`mode & 0o111` 永远为 0
+#    → 会误报「没有可执行位」，即使文件在本机是 755。
+#    ✅ 所以本地判据只能是 **git 索引里的 100755**（那才是 CI 实际拿到的东西）。
+#    文件系统权限只做参考，不作判据（在本条 24b 里查）。
+debian_dir = "layout/DEBIAN"
+is_windows = (os.name == "nt")
+if os.path.isdir(debian_dir):
+    for name in sorted(os.listdir(debian_dir)):
+        if name in ("postinst", "preinst", "postrm", "prerm"):
+            p = os.path.join(debian_dir, name)
+            st = os.stat(p)
+            if is_windows:
+                mode = st.st_mode & 0o777
+                print("   ℹ️  %s 本机权限 %o（Windows 下不可信，不作为判据）" % (p, mode))
+            else:
+                mode = st.st_mode & 0o777
+                if not (0o555 <= mode <= 0o775) or not (mode & 0o111):
+                    fail("❌ %s 权限 %o 不合法（须 0555~0775 且含可执行位）" % (p, mode))
+                else:
+                    print("   ✅ %s 权限 %o" % (p, mode))
+else:
+    print("   （无 layout/DEBIAN 目录，跳过）")
+
+print("--- 检查 24b：⭐ 维护脚本的 git 索引权限位必须是 100755（真正判据）---")
+# ⚠️ 光看文件系统权限会漏 —— git 只存 100644 / 100755 两种。
+#    Windows 上新建文件恒为 100644，必须显式 update-index --chmod=+x。
+try:
+    import subprocess
+    out = subprocess.run(["git", "ls-files", "-s", debian_dir],
+                         capture_output=True, text=True).stdout
+    checked = 0
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) >= 4:
+            mode, path = parts[0], parts[3]
+            if path.rsplit("/", 1)[-1] in ("postinst", "preinst", "postrm", "prerm"):
+                checked += 1
+                if mode != "100755":
+                    fail("❌ git 索引里 %s 权限是 %s（应为 100755）" % (path, mode))
+                    fail("   修复：git update-index --chmod=+x %s" % path)
+                else:
+                    print("   ✅ git 索引 %s = 100755" % path)
+    if checked == 0:
+        print("   （git 索引里没有维护脚本）")
+except Exception as e:
+    print("   （git 不可用，跳过索引检查：%s）" % e)
+
+# ---------------------------------------------------------------------------
 print()
 if FAIL:
     print("🛑 本地预检未通过，修完再推 CI")
