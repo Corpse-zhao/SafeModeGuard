@@ -501,6 +501,68 @@ jobs:
           print('✅ 无 double-integerValue')
           PY
 
+          echo "--- 检查 24c：⭐ 用到的 C 库符号必须有对应 #import ---"
+          python3 - <<'PY' || FAIL=1
+          import io, os, re, sys, glob
+
+          def read(p):
+              return io.open(p, encoding='utf-8', errors='replace').read()
+
+          def strip_comments(s):
+              s = re.sub(r'/\*.*?\*/', '', s, flags=re.S)
+              return re.sub(r'//[^\n]*', '', s)
+
+          # 血泪（v0.2.0）：SMGProbeRebootSymbol 用了 dlsym/RTLD_DEFAULT，
+          # 但没 import <dlfcn.h> → 编译报一串看着莫名的错（其实都是同一处）：
+          #   call to undeclared function 'dlsym'
+          #   declaration of 'dlsym' must be imported from module 'Darwin.POSIX.dlfcn'
+          #   conflicting types for 'dlsym'
+          #   use of undeclared identifier 'RTLD_DEFAULT'
+          # ⚠️ 而 Preflight 全绿 —— 说明「符号用没用」查了，「头文件导没导」没查。
+          C_SYMBOL_HEADERS = {
+              'dlsym': 'dlfcn.h', 'dlopen': 'dlfcn.h', 'dlclose': 'dlfcn.h',
+              'RTLD_DEFAULT': 'dlfcn.h', 'RTLD_NOW': 'dlfcn.h',
+              'getpid': 'unistd.h', 'reboot': 'unistd.h',
+              'kill': 'signal.h', 'signal': 'signal.h',
+              'sysctl': 'sys/sysctl.h', 'sysctlbyname': 'sys/sysctl.h',
+              'posix_spawn': 'spawn.h', 'mmap': 'sys/mman.h',
+              'malloc': 'stdlib.h', 'free': 'stdlib.h', 'printf': 'stdio.h',
+              'strlen': 'string.h', 'memcpy': 'string.h',
+              'dispatch_after': 'dispatch/dispatch.h',
+          }
+          files = sorted(glob.glob('*.m') + glob.glob('*.x') + glob.glob('*.h')
+                         + glob.glob('prefs/*.m'))
+          bad = 0
+          for path in files:
+              raw = read(path)
+              # ⚠️ 必须用剥掉注释后的正文找 #import，
+              #    否则被注释掉的 `// #import <dlfcn.h>` 也算"已导入" → 假阴性
+              imports = set(re.findall(r'#import\s*[<"]([^>"]+)[>"]', strip_comments(raw)))
+              merged = strip_comments(raw)
+              for lh in re.findall(r'#import\s+"([^"]+)"', strip_comments(raw)):
+                  for cand in [lh, os.path.join(os.path.dirname(path), lh)]:
+                      if os.path.exists(cand):
+                          lraw = read(cand)
+                          merged += '\n' + strip_comments(lraw)
+                          imports |= set(re.findall(r'#import\s*[<"]([^>"]+)[>"]',
+                                                    strip_comments(lraw)))
+                          break
+              miss = []
+              for sym, hdr in C_SYMBOL_HEADERS.items():
+                  if re.search(r'(?<![\w>])' + re.escape(sym) + r'\s*\(', merged):
+                      if not any(i.endswith(hdr) for i in imports):
+                          miss.append((sym, hdr))
+              if re.search(r'(?<![\w])RTLD_DEFAULT(?![\w])', merged):
+                  if not any(i.endswith('dlfcn.h') for i in imports):
+                      miss.append(('RTLD_DEFAULT', 'dlfcn.h'))
+              for sym, hdr in sorted(set(miss)):
+                  print('❌ %s 用了 %s 但没 #import <%s>' % (path, sym, hdr))
+                  bad = 1
+          if bad:
+              sys.exit(1)
+          print('✅ C 库符号的 import 检查通过')
+          PY
+
           echo "--- 检查 25：⭐ 频率判定必须「先记本次再判定」---"
           python3 - <<'PY' || FAIL=1
           import io, re, sys

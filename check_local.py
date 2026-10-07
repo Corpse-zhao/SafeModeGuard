@@ -552,6 +552,70 @@ def find_body(src, header_regex):
     return None, None
 
 
+print("--- 检查 24c：⭐ 用到的 C 库符号必须有对应 #import ---")
+# 血泪（2026-10-07 v0.2.0）：SMGProbeRebootSymbol 用了 dlsym/RTLD_DEFAULT，
+# 但 SMGCommon.h 没 import <dlfcn.h> → 编译报一串看着莫名的错（其实都是同一处）：
+#   call to undeclared function 'dlsym'
+#   declaration of 'dlsym' must be imported from module 'Darwin.POSIX.dlfcn'
+#   conflicting types for 'dlsym'
+#   use of undeclared identifier 'RTLD_DEFAULT'
+# ⚠️ 而 Preflight 全绿 —— 静态检查有盲区：「符号用没用」查了，「头文件导没导」没查。
+#    本检查补上：把「常见 C 库符号 → 必需头文件」做成表，双向核对。
+#
+# ⚠️ 不能用「有没有 include 这个头」单边判断 —— 很多头是 Foundation 间接拉进来的。
+#    必须**先确认符号真的被用了**，再要求显式 import
+#    （显式 import 无害，且不依赖传递包含的偶然性）。
+C_SYMBOL_HEADERS = {
+    "dlsym": "dlfcn.h", "dlopen": "dlfcn.h", "dlclose": "dlfcn.h",
+    "RTLD_DEFAULT": "dlfcn.h", "RTLD_NOW": "dlfcn.h",
+    "getpid": "unistd.h", "reboot": "unistd.h",
+    "kill": "signal.h", "signal": "signal.h",
+    "sysctl": "sys/sysctl.h", "sysctlbyname": "sys/sysctl.h",
+    "posix_spawn": "spawn.h",
+    "mmap": "sys/mman.h",
+    "malloc": "stdlib.h", "free": "stdlib.h",
+    "printf": "stdio.h",
+    "strlen": "string.h", "memcpy": "string.h",
+    "dispatch_after": "dispatch/dispatch.h",
+}
+_c_hdr_files = sorted(glob.glob("*.m") + glob.glob("*.x") + glob.glob("*.h") + glob.glob("prefs/*.m"))
+_c_hdr_any_use = False
+# ⚠️⚠️ 必须用**剥掉注释后**的正文来找 #import ——
+#    否则被注释掉的 `// #import <dlfcn.h>` 也会被当成"已导入"
+#    → 检查恒为绿（假阴性）。这正是 §54「子串匹配认错对象」的变体：
+#    匹配到了字面文本，但那行根本不是有效代码。
+#    （本检查第一版就踩了这个坑，靠注入测试发现。）
+for path in _c_hdr_files:
+    _raw = read(path)
+    _imports = set(re.findall(r'#import\s*[<"]([^>"]+)[>"]', strip_comments(_raw)))
+    # 本文件 + 其 import 的本地头，合并检查「符号是否被使用」
+    # ⚠️ 同时要把本地头自己的 import 也算进来 ——
+    #    SMGCommon.m 自己只 import "SMGCommon.h"，而 <dlfcn.h> 在后者里。
+    #    只看本文件的 import 会误报「用了 dlsym 但没导 dlfcn.h」。
+    _merged = strip_comments(_raw)
+    for _lh in re.findall(r'#import\s+"([^"]+)"', strip_comments(_raw)):
+        for _cand in [_lh, os.path.join(os.path.dirname(path), _lh)]:
+            if os.path.exists(_cand):
+                _lraw = read(_cand)
+                _merged += "\n" + strip_comments(_lraw)
+                _imports |= set(re.findall(r'#import\s*[<"]([^>"]+)[>"]', strip_comments(_lraw)))
+                break
+    _miss = []
+    for _sym, _hdr in C_SYMBOL_HEADERS.items():
+        if re.search(r"(?<![\w>])" + re.escape(_sym) + r"\s*\(", _merged):
+            _c_hdr_any_use = True
+            if not any(i.endswith(_hdr) for i in _imports):
+                _miss.append((_sym, _hdr))
+    # 非函数式常量单独处理
+    if re.search(r"(?<![\w])RTLD_DEFAULT(?![\w])", _merged):
+        _c_hdr_any_use = True
+        if not any(i.endswith("dlfcn.h") for i in _imports):
+            _miss.append(("RTLD_DEFAULT", "dlfcn.h"))
+    for _sym, _hdr in sorted(set(_miss)):
+        fail("❌ %s 用了 %s 但没 #import <%s>" % (path, _sym, _hdr))
+if not FAIL:
+    print("   ✅ C 库符号的 import 检查通过（有使用的文件均已显式 import）")
+
 print("--- 检查 25：⭐ 频率判定必须「先记本次再判定」---")
 # 逻辑陷阱：如果先数窗口再记本次，第 2 次注销时窗口里只有 1 条 → 永远判不出来，
 # 永远慢一拍。所以要断言：addObject:@(now) 出现在统计循环之前。

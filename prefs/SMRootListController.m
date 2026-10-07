@@ -1,6 +1,7 @@
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 #import <notify.h>
+#import <unistd.h>          // getpid()（日志里打 pid）。显式导入，不靠 UIKit 传递包含
 #import "SMRootListController.h"
 
 // ===========================================================================

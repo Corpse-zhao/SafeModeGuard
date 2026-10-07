@@ -6,6 +6,13 @@
 #import <unistd.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+// ⭐ dlsym / RTLD_DEFAULT 在这里（主动重启的运行时符号探测要用）
+//   血泪：漏了这句会报一串看着莫名的错（都是同一处引起的级联）：
+//     call to undeclared function 'dlsym'
+//     declaration of 'dlsym' must be imported from module 'Darwin.POSIX.dlfcn'
+//     conflicting types for 'dlsym'
+//     use of undeclared identifier 'RTLD_DEFAULT'
+#import <dlfcn.h>
 
 #define SMG_VERSION      @"0.2.0"
 #define SMG_PREFS_DOMAIN @"com.blr.safemodeguard"
