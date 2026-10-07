@@ -18,7 +18,7 @@ static NSString * const kSMGPrefsDomain   = @"com.blr.safemodeguard";
 // ⚠️ 面板侧自定的版本常量：prefs 不加载 dylib，不能引 SMG_VERSION。
 //    诊断页会把它与插件端写入日志的版本比对，不一致即"插件本体没加载"。
 //    ⚠️ 它必须与 SMGCommon.h 的 SMG_VERSION 保持一致（check_local.py 会校验）。
-static NSString * const kSMGPrefsVersion  = @"0.1.0";
+static NSString * const kSMGPrefsVersion  = @"0.2.0";
 
 static NSString *SMGPrefsSharedDir(void) {
     static NSString *dir = nil;
@@ -232,6 +232,39 @@ static void SMRootListControllerPrefsChanged(CFNotificationCenterRef center,
     } @catch (__unused NSException *e) { return @"（读取失败）"; }
 }
 
+// v0.2.0：展示频率判定用的启动时间戳（这是判断"多密"的直接证据）
+- (id)readBootTimes:(PSSpecifier *)spec {
+    @try {
+        NSArray *a = [NSArray arrayWithContentsOfFile:SMGPrefsPath(@"_boottimes.plist")];
+        if (!a.count) return @"（暂无时间戳。插件还没在桌面里跑过，或刚被重置。）";
+
+        id rawWin = SMPrefsGet(@"rapidWindow");
+        double win = rawWin ? [rawWin doubleValue] : 60.0;
+        id rawCnt = SMPrefsGet(@"rapidCount");
+        NSInteger need = rawCnt ? [rawCnt integerValue] : 2;
+
+        double now = [NSDate date].timeIntervalSince1970;
+        NSInteger inWin = 0;
+        NSMutableString *out = [NSMutableString string];
+        NSInteger shown = 0;
+        // 倒序：最新在前
+        for (NSInteger i = (NSInteger)a.count - 1; i >= 0 && shown < 10; i--, shown++) {
+            id v = a[(NSUInteger)i];
+            if (![v respondsToSelector:@selector(doubleValue)]) continue;
+            double t = [v doubleValue];
+            double ago = now - t;
+            if (ago <= win) inWin++;
+            [out appendFormat:@"%@（%.0f 秒前）\n",
+                [NSDate dateWithTimeIntervalSince1970:t], ago];
+        }
+        NSString *head = [NSString stringWithFormat:
+            @"窗口 %.0f 秒内共 %ld 次 / 阈值 %ld → %@\n\n",
+            win, (long)inWin, (long)need,
+            (inWin >= need) ? @"🔴 已超阈值（会被判为失控循环）" : @"🟢 未超阈值"];
+        return [head stringByAppendingString:out];
+    } @catch (__unused NSException *e) { return @"（读取失败）"; }
+}
+
 #pragma mark 动作（全部无参，与已验证可用的兄弟同款形态）
 
 - (void)smgEnterSafeMode {
@@ -292,14 +325,72 @@ static void SMRootListControllerPrefsChanged(CFNotificationCenterRef center,
         [fm removeItemAtPath:SMGPrefsPath(@"_failcount.txt") error:NULL];
         [fm removeItemAtPath:SMGPrefsPath(@"_boottotal.txt") error:NULL];
         [fm removeItemAtPath:SMGPrefsPath(@"_history.plist") error:NULL];
-        SMPrefsLog(@"[设置] 已重置全部启动状态计数");
+        // v0.2.0：启动时间戳也要清，否则重置后第一次启动可能立刻被判为"频率突增"
+        [fm removeItemAtPath:SMGPrefsPath(@"_boottimes.plist") error:NULL];
+        SMPrefsLog(@"[设置] 已重置全部启动状态计数（含启动时间戳）");
         [self reloadSpecifiers];
 
         UIAlertController *a = [UIAlertController
             alertControllerWithTitle:@"已重置"
-                             message:@"连续异常启动计数、累计启动次数、启动历史均已清空。\n（安全模式标记不受影响）"
+                             message:@"连续异常启动计数、累计启动次数、启动历史、启动时间戳均已清空。\n（安全模式标记不受影响）"
                       preferredStyle:UIAlertControllerStyleAlert];
         [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:a animated:YES completion:nil];
+    } @catch (__unused NSException *e) { }
+}
+
+// v0.2.0：频率窗口与次数（用输入框改，避免屏幕上堆一堆 stepper）
+- (void)smgShowRapidDetail {
+    @try {
+        id rawWin = SMPrefsGet(@"rapidWindow");
+        double win = rawWin ? [rawWin doubleValue] : 60.0;
+        id rawCnt = SMPrefsGet(@"rapidCount");
+        NSInteger need = rawCnt ? [rawCnt integerValue] : 2;
+
+        UIAlertController *a = [UIAlertController
+            alertControllerWithTitle:@"频率窗口与次数"
+            message:[NSString stringWithFormat:
+                @"当前设置：%@ 秒内启动满 %ld 次即判定为失控循环。\n\n"
+                @"• 窗口越短 / 次数越少 → 自救越快，但误报风险越高。\n"
+                @"• 默认 60 秒 / 2 次，已能避开「连装两个插件」这类正常连发。\n"
+                @"• 如果你经常在装插件时连续注销，建议改成 30 秒 / 3 次。\n\n"
+                @"修改后立即生效，无需重启桌面。",
+                win > 0 ? [NSString stringWithFormat:@"%.0f", win] : @"60",
+                (long)need]
+            preferredStyle:UIAlertControllerStyleAlert];
+
+        [a addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+            tf.placeholder = @"窗口秒数（10 ~ 600）";
+            tf.keyboardType = UIKeyboardTypeNumberPad;
+            tf.text = [NSString stringWithFormat:@"%.0f", win > 0 ? win : 60.0];
+        }];
+        [a addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+            tf.placeholder = @"次数阈值（2 ~ 10）";
+            tf.keyboardType = UIKeyboardTypeNumberPad;
+            tf.text = [NSString stringWithFormat:@"%ld", (long)need];
+        }];
+
+        __weak SMRootListController *weakSelf = self;
+        [a addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+        [a addAction:[UIAlertAction actionWithTitle:@"保存" style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *act) {
+            @try {
+                NSArray<UITextField *> *tfs = a.textFields;
+                double w = tfs.count > 0 ? [tfs[0].text doubleValue] : 60.0;
+                NSInteger c = tfs.count > 1 ? (NSInteger)[tfs[1].text integerValue] : 2;
+                // 与插件端同款钳制，避免面板存进越界值导致插件端行为异常
+                if (w < 10.0)  w = 10.0;
+                if (w > 600.0) w = 600.0;
+                if (c < 2)  c = 2;
+                if (c > 10) c = 10;
+
+                SMPrefsSet(@"rapidWindow", @(w));
+                SMPrefsSet(@"rapidCount",  @(c));
+                SMPrefsLog(@"[设置] 频率阈值 → %.0f 秒内 %ld 次", w, (long)c);
+                [weakSelf reloadSpecifiers];
+            } @catch (__unused NSException *e2) { }
+        }]];
+
         [self presentViewController:a animated:YES completion:nil];
     } @catch (__unused NSException *e) { }
 }
@@ -351,6 +442,48 @@ static void SMRootListControllerPrefsChanged(CFNotificationCenterRef center,
         id v = SMPrefsGet(@"enabled");
         return v ? @([v boolValue]) : @YES;
     } @catch (__unused NSException *e) { return @YES; }
+}
+
+// ---- v0.2.0：频率判定开关 ----
+
+- (void)setRapidEnabledPref:(id)value specifier:(PSSpecifier *)spec {
+    @try {
+        SMPrefsSet(@"rapidExitEnabled", value);
+        SMPrefsLog(@"[设置] 频率判定 → %@", [value boolValue] ? @"开" : @"关");
+    } @catch (__unused NSException *e) { }
+}
+
+- (id)getRapidEnabledPref:(PSSpecifier *)spec {
+    @try {
+        id v = SMPrefsGet(@"rapidExitEnabled");
+        return v ? @([v boolValue]) : @YES;   // 与插件端默认一致：开
+    } @catch (__unused NSException *e) { return @YES; }
+}
+
+// ---- v0.2.0：主动重启开关 ----
+
+- (void)setRebootEnabledPref:(id)value specifier:(PSSpecifier *)spec {
+    @try {
+        BOOL on = [value boolValue];
+        SMPrefsSet(@"rebootEnabled", value);
+        SMPrefsLog(@"[设置] 主动重启 → %@", on ? @"开" : @"关");
+        // 这是本插件唯一的危险操作，开启时必须再确认一次
+        if (on) {
+            UIAlertController *a = [UIAlertController
+                alertControllerWithTitle:@"⚠️ 已开启主动重启"
+                message:@"请确认你理解风险：\n\n失控循环正在反复杀桌面，此时插件主动重启可能与系统自己的重启撞车，卡在更早的启动阶段。\n\n插件已内置三道硬闸降低风险：\n① 只在安全模式标记写入成功后尝试；\n② 每个进程只尝试一次；\n③ 探测不到可用的重启入口就安静放弃。\n\n如果你不确定，建议关掉它 —— 写完标记后你手动重启，效果一样。"
+                preferredStyle:UIAlertControllerStyleAlert];
+            [a addAction:[UIAlertAction actionWithTitle:@"我知道了" style:UIAlertActionStyleDefault handler:nil]];
+            [self presentViewController:a animated:YES completion:nil];
+        }
+    } @catch (__unused NSException *e) { }
+}
+
+- (id)getRebootEnabledPref:(PSSpecifier *)spec {
+    @try {
+        id v = SMPrefsGet(@"rebootEnabled");
+        return v ? @([v boolValue]) : @NO;    // ⚠️ 与插件端默认一致：关
+    } @catch (__unused NSException *e) { return @NO; }
 }
 
 @end

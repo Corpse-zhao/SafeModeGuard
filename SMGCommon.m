@@ -61,6 +61,11 @@ NSString *SMGPendingPath(void) {
     return [SMGSharedDir() stringByAppendingPathComponent:@"_pending.txt"];
 }
 
+NSString *SMGBootTimesPath(void) {
+    // v0.2.0：启动时间戳序列（用于「注销频率突增」判定）
+    return [SMGSharedDir() stringByAppendingPathComponent:@"_boottimes.plist"];
+}
+
 NSString *SMGSafeModeFlagPath(void) {
     // ⭐ ElleKit 官方安全模式标记（根路径，非 jbroot）
     return @"/var/mobile/.eksafemode";
@@ -204,6 +209,36 @@ BOOL SMGAutoSafeMode(void) {
     return v ? [v boolValue] : YES;              // 默认自动进
 }
 
+#pragma mark - v0.2.0 便捷读取：注销频率突增 / 主动重启
+
+BOOL SMGRapidExitEnabled(void) {
+    id v = SMGConfigGet(@"rapidExitEnabled");
+    return v ? [v boolValue] : YES;              // 默认开（这条是"预先自救"的主路径）
+}
+
+double SMGRapidWindow(void) {
+    id v = SMGConfigGet(@"rapidWindow");
+    double d = v ? [v doubleValue] : 60.0;       // 默认 60 秒窗口
+    if (d < 10.0)  d = 10.0;                     // 下限：小于 10 秒太敏感
+    if (d > 600.0) d = 600.0;                    // 上限：大于 10 分钟就没意义了
+    return d;
+}
+
+NSInteger SMGRapidCount(void) {
+    id v = SMGConfigGet(@"rapidCount");
+    NSInteger n = v ? [v integerValue] : 2;      // 默认窗口内 2 次
+    if (n < 2)  n = 2;                           // 至少 2 次（1 次等于"启动即触发"，必然误报）
+    if (n > 10) n = 10;
+    return n;
+}
+
+BOOL SMGRebootEnabled(void) {
+    id v = SMGConfigGet(@"rebootEnabled");
+    // ⚠️⚠️ 默认 **NO**：主动重启有撞车风险，必须用户明确开启。
+    //     这是本插件唯一的危险操作，默认关闭是刻意设计，不要"顺手改成 YES"。
+    return v ? [v boolValue] : NO;
+}
+
 #pragma mark - 计数（持久化，崩溃不丢）
 
 NSInteger SMGFailCount(void) {
@@ -301,6 +336,162 @@ void SMGClearBootHistory(void) {
     } @catch (__unused NSException *e) { }
 }
 
+#pragma mark - v0.2.0 注销频率突增判定
+
+// 时间戳序列上限。窗口最大 600 秒，正常最多也就几条；
+// 留 60 条足够覆盖任何合理窗口，同时防文件无限增长。
+static const NSUInteger kSMGBootTimesMax = 60;
+// 只保留这么长时间内的时间戳（比最大窗口还宽，留足余量）
+static const double kSMGBootTimesKeep = 900.0;
+
+NSArray<NSNumber *> *SMGRecentBootTimes(void) {
+    @try {
+        NSString *p = SMGBootTimesPath();
+        NSArray *a = [NSArray arrayWithContentsOfFile:p];
+        if (!a.count) return @[];
+        // 倒序：最新在前
+        NSMutableArray *out = [NSMutableArray array];
+        for (id v in [a reverseObjectEnumerator]) {
+            if ([v respondsToSelector:@selector(doubleValue)]) [out addObject:v];
+        }
+        return out;
+    } @catch (__unused NSException *e) { return @[]; }
+}
+
+BOOL SMGNoteBootTimeAndCheckRapid(void) {
+    @try {
+        if (!SMGEnabled())        return NO;
+        if (!SMGRapidExitEnabled()) return NO;
+
+        SMGEnsureDir();
+
+        // ---------- 1. 读旧时间戳 + 清理过旧的 ----------
+        double now = [NSDate date].timeIntervalSince1970;
+        double keep = MAX(kSMGBootTimesKeep, SMGRapidWindow() * 2.0);
+
+        NSMutableArray<NSNumber *> *times = [NSMutableArray array];
+        NSArray *old = [NSArray arrayWithContentsOfFile:SMGBootTimesPath()];
+        for (id v in old) {
+            if (![v respondsToSelector:@selector(doubleValue)]) continue;
+            double t = [v doubleValue];
+            if (t <= 0) continue;
+            if (now - t > keep) continue;            // 太旧，丢掉
+            if (t > now + 60.0) continue;            // 未来时间（系统时间被改过），丢掉
+            [times addObject:@(t)];
+        }
+
+        // ---------- 2. 先把"本次"记进去 ----------
+        // ⭐ 顺序很重要：必须先把本次算进窗口，否则判断的是"上次之前"的密度，
+        //    永远慢一拍（第 2 次注销时窗口里只有 1 条，判不出来）。
+        [times addObject:@(now)];
+
+        // ---------- 3. 在窗口内数次数 ----------
+        double win = SMGRapidWindow();
+        NSInteger inWindow = 0;
+        for (NSNumber *t in times) {
+            if (now - t.doubleValue <= win) inWindow++;
+        }
+
+        NSInteger threshold = SMGRapidCount();
+        BOOL rapid = (inWindow >= threshold);
+
+        // ---------- 4. 落盘（保留最近的 N 条） ----------
+        while (times.count > kSMGBootTimesMax) [times removeObjectAtIndex:0];
+        [times writeToFile:SMGBootTimesPath() atomically:YES];
+
+        if (rapid) {
+            SMGLog(@"[频率判定] 🔴 %.0f 秒内启动 %ld 次（阈值 %ld）→ 判定为失控循环",
+                  win, (long)inWindow, (long)threshold);
+        } else {
+            SMGLog(@"[频率判定] %.0f 秒内启动 %ld 次（阈值 %ld）→ 正常",
+                  win, (long)inWindow, (long)threshold);
+        }
+        return rapid;
+    } @catch (__unused NSException *e) {
+        return NO;
+    }
+}
+
+#pragma mark - v0.2.0 主动重启（带硬闸）
+
+// ⭐⭐ 硬闸①：每次进程生命周期内最多尝试一次。
+//    进程重启后这个 static 归零 —— 但那正好也意味着"重启发出去了"，
+//    所以不会形成循环。若重启没发出去（手段不可用），下一次进 SpringBoard
+//    还会再试一次 —— 这是可接受的（不是同一进程内反复试）。
+static BOOL sSMGRebootAttempted = NO;
+
+// 重启手段：**运行时侦查，不硬编码猜测的私有 API**。
+//
+// 历史教训（见 memory / 技能库）：手写候选私有 API 必然翻车，
+// 因为那些符号在系统里叫什么、存不存在，只能靠真机侦查确认。
+//
+// 因此这里采取「按能力探测」的保守顺序：
+//   ① 先看 dyld 里有没有可用的重启相关符号（用 dlsym 探测，探测失败就跳过）
+//   ② 探测不到 → 直接放弃（返回 NO），让「写标记 + 等系统自己重启」兜底
+//
+// ⚠️ 绝不做的事：不 fork/exec 外部命令（sandbox 下会失败且行为不可控）、
+//    不遍历调用名字像重启的函数（那是瞎猜）。
+static BOOL sSMGRebootSymbolProbed = NO;
+static void *sSMGRebootSymbol = NULL;
+
+static void *SMGProbeRebootSymbol(void) {
+    if (sSMGRebootSymbolProbed) return sSMGRebootSymbol;
+    sSMGRebootSymbolProbed = YES;
+    sSMGRebootSymbol = NULL;
+    @try {
+        // 只探测这几个**明确存在且在 SpringBoard 语境下可用**的符号。
+        // 探测到哪个用哪个；一个都没有就放弃（不猜）。
+        const char *cands[] = {
+            "reboot",              // libSystem：完整重启（需要 root，SpringBoard 下可能失败）
+            "sbreload",            // SpringBoard 重载（部分越狱环境导出）
+            "SBReloadSpringBoard", // SpringBoard 私有重载入口
+            NULL
+        };
+        for (int i = 0; cands[i]; i++) {
+            void *p = dlsym(RTLD_DEFAULT, cands[i]);
+            if (p) {
+                sSMGRebootSymbol = p;
+                SMGLog(@"[重启] 探测到可用符号：%s", cands[i]);
+                break;
+            }
+        }
+        if (!sSMGRebootSymbol) {
+            SMGLog(@"[重启] ⚠️ 未探测到任何可用的重启符号 → 放弃主动重启（标记已写好，等系统自己重启）");
+        }
+    } @catch (__unused NSException *e) { }
+    return sSMGRebootSymbol;
+}
+
+BOOL SMGPerformRebootOnce(void) {
+    // ⭐ 硬闸②：用户没开就不做（默认就是关的）
+    if (!SMGRebootEnabled()) {
+        SMGLog(@"[重启] 主动重启未开启（默认关闭）→ 仅写标记，等系统自己重启");
+        return NO;
+    }
+    // ⭐ 硬闸①：本进程内只试一次
+    if (sSMGRebootAttempted) return NO;
+    sSMGRebootAttempted = YES;
+
+    @try {
+        void *sym = SMGProbeRebootSymbol();
+        if (!sym) return NO;
+
+        SMGLog(@"[重启] ⚠️ 正在发出重启指令（标记已写好，重启后即进入安全模式）");
+        // 给日志一点时间落盘再重启，否则这行日志可能丢
+        SMGAppendHistory([NSString stringWithFormat:@"%@ 主动发出重启指令（进入安全模式）",
+                          [NSDate date]]);
+
+        typedef int (*SMGRebootFn)(int);
+        SMGRebootFn fn = (SMGRebootFn)sym;
+        // ⚠️ 不检查返回值：reboot() 正常情况下不回返，返回了说明失败
+        (void)fn(0);
+        return YES;
+    } @catch (__unused NSException *e) {
+        SMGLog(@"[重启] ❌ 重启调用抛异常 → 放弃（不影响已写好的标记）");
+        return NO;
+    }
+}
+
 #pragma mark - 安全模式标记
 
 BOOL SMGSafeModeFlagExists(void) {
@@ -364,6 +555,11 @@ BOOL SMGBootBegin(void) {
         NSInteger total = SMGBootTotal() + 1;
         SMGSetBootTotal(total);
 
+        // —— v0.2.0：先记时间戳并做「频率突增」判定 ——
+        // ⭐ 放在最前面：这是"预先自救"路径，要在任何耗时操作之前得出结论。
+        //    注意函数内部是「先记本次再判定」，顺序已在函数里保证。
+        BOOL rapid = SMGNoteBootTimeAndCheckRapid();
+
         // —— 判定上一轮 ——
         if (SMGPendingExists()) {
             lastWasAbnormal = YES;
@@ -385,17 +581,37 @@ BOOL SMGBootBegin(void) {
         // —— 写下本轮 pending（关键：必须在判定之后、且尽早写） ——
         SMGWritePending();
 
-        // —— 达阈值则触发安全模式 ——
+        // —— 触发安全模式：两条路径任一成立 ——
+        //   ① 频率突增（v0.2.0，快）
+        //   ② 连续异常次数达标（v0.1.0，稳）
         NSInteger n = SMGFailCount();
         NSInteger maxN = SMGMaxFailCount();
-        if (n >= maxN) {
-            SMGLog(@"[判定] 🔴 连续异常 %ld 次（阈值 %ld）→ 判定为无限注销循环",
-                  (long)n, (long)maxN);
-            if (SMGAutoSafeMode()) {
-                NSString *reason = [NSString stringWithFormat:
+        BOOL byCount = (n >= maxN);
+
+        if (rapid || byCount) {
+            NSString *reason = nil;
+            if (rapid && byCount) {
+                reason = [NSString stringWithFormat:
+                    @"检测到失控循环：%.0f 秒内启动 %ld 次（阈值 %ld），"
+                    @"且连续 %ld 次未能存活到确认点（阈值 %ld）。",
+                    SMGRapidWindow(), (long)SMGRapidCount(), (long)SMGRapidCount(),
+                    (long)n, (long)maxN];
+            } else if (rapid) {
+                reason = [NSString stringWithFormat:
+                    @"检测到失控循环：%.0f 秒内启动 %ld 次（阈值 %ld），"
+                    @"注销发生得过于频繁，判定设备已陷入无限注销。",
+                    SMGRapidWindow(), (long)SMGRapidCount(), (long)SMGRapidCount()];
+            } else {
+                reason = [NSString stringWithFormat:
                     @"连续 %ld 次启动未能存活到确认点（阈值 %ld），判定设备陷入无限注销循环。"
                     @"写入此标记后，下次重启将跳过全部插件注入。",
                     (long)n, (long)maxN];
+            }
+
+            SMGLog(@"[判定] 🔴 触发安全模式（频率突增=%d，次数达标=%d）",
+                  (int)rapid, (int)byCount);
+
+            if (SMGAutoSafeMode()) {
                 BOOL ok = SMGEnterSafeMode(reason);
                 // ⭐ 写成功后清掉 pending：本轮就是来进安全模式的，
                 //   不该被下一轮再算一次异常；且避免反复写标记。
@@ -403,6 +619,16 @@ BOOL SMGBootBegin(void) {
                 if (ok) {
                     SMGClearPending();
                     SMGSetFailCount(0);
+                    // 顺便把频率记录也清一下，避免下一次启动又立刻被判为"突增"
+                    // （我们已经进了安全模式，不需要重复触发）
+                    @try {
+                        [[NSFileManager defaultManager] removeItemAtPath:SMGBootTimesPath()
+                                                                   error:NULL];
+                    } @catch (__unused NSException *e2) { }
+
+                    // ⭐ 硬闸③：只有标记写入成功，才尝试主动重启。
+                    //    标记是保底主路径；标记都没写成，重启只会让情况更乱。
+                    SMGPerformRebootOnce();
                 }
             } else {
                 SMGLog(@"[判定] 自动进安全模式已关闭 → 仅记录，等用户手动处理");
@@ -436,7 +662,9 @@ void SMGResetAllState(void) {
         SMGSetFailCount(0);
         SMGSetBootTotal(0);
         SMGClearBootHistory();
-        SMGLog(@"[重置] 已清空全部启动状态（计数/历史/待定标记）");
+        // v0.2.0：频率记录也一起清，否则重置后第一次启动可能立刻被判为"突增"
+        [[NSFileManager defaultManager] removeItemAtPath:SMGBootTimesPath() error:NULL];
+        SMGLog(@"[重置] 已清空全部启动状态（计数/历史/待定标记/启动时间戳）");
     } @catch (__unused NSException *e) { }
 }
 

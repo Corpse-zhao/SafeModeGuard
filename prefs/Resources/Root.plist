@@ -17,6 +17,36 @@
         },
         {
             cell = PSGroupSpecifier;
+            label = "快速自救（注销频率突增）";
+            footerText = "失控循环有个显著特征：注销又快又密。正常用一天也未必注销一次；一旦插件把桌面搞死，注销会变成每几秒一次。\n\n本条是最快的自救路径 —— 一旦在窗口期内启动次数超限，立刻写入安全模式标记，不用等熬满 30 秒、也不用等满 3 轮。\n\n⚠️ 注意误报：如果你在窗口期内连续正常注销（例如在 Sileo 里连装两个插件），也会被判为突增。可在本页「退出安全模式」自救。";
+        },
+        {
+            cell = PSSwitchCell;
+            key = "rapidExitEnabled";
+            label = "启用频率判定";
+            default = true;
+            defaultSet = true;
+            get = "getRapidEnabledPref:";
+            set = "setRapidEnabledPref:specifier:";
+            footerText = "关闭后只看「连续 N 次未能存活到确认点」，回到 v0.1.0 的判定逻辑。";
+        },
+        {
+            cell = PSLinkCell;
+            label = "频率窗口与次数";
+            action = "smgShowRapidDetail";
+        },
+        {
+            cell = PSSwitchCell;
+            key = "rebootEnabled";
+            label = "写标记后主动重启";
+            default = false;
+            defaultSet = true;
+            get = "getRebootEnabledPref:";
+            set = "setRebootEnabledPref:specifier:";
+            footerText = "⚠️ 高风险，默认关闭。\n\n开启后，插件在成功写入安全模式标记后会尝试主动重启一次，让你立刻进入安全模式，不用再黑屏等待。\n\n风险：失控循环本身正在反复杀桌面，此时主动重启可能与之撞车，卡在更早的启动阶段。因此插件内置了三道硬闸：只在写标记成功后尝试、每个进程只试一次、探测不到可用的重启入口就安静放弃。\n\n保险做法：保持关闭。写完标记后手动长按电源键重启，效果一样且零风险。";
+        },
+        {
+            cell = PSGroupSpecifier;
             label = "当前状态";
         },
         {
@@ -77,6 +107,16 @@
             cell = PSStaticTextCell;
             label = "记录";
             get = "readBootHistory:";
+        },
+        {
+            cell = PSGroupSpecifier;
+            label = "启动时间戳";
+            footerText = "「频率判定」用的就是这份数据：插件把每次桌面启动的时间写进磁盘，再检查滑动窗口内的次数。\n\n如果你刚经历误判，可在这里看清到底多密，或点上方「重置启动计数与历史」清空。";
+        },
+        {
+            cell = PSStaticTextCell;
+            label = "时间戳";
+            get = "readBootTimes:";
         }
     );
 }

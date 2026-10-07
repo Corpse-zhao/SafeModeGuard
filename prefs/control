@@ -1,6 +1,6 @@
 Package: com.blr.safemodeguard.prefs
 Name: 安全模式卫士设置
-Version: 0.1.0
+Version: 0.2.0
 Architecture: iphoneos-arm
 Description: 安全模式卫士插件的设置面板
 Maintainer: 板栗仁

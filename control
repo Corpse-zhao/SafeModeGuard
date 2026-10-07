@@ -1,6 +1,6 @@
 Package: com.blr.safemodeguard
 Name: 安全模式卫士
-Version: 0.1.0
+Version: 0.2.0
 Architecture: iphoneos-arm
 Description: 防"无限注销/黑屏砖机"。插件在磁盘上记录每次 SpringBoard 启动，若连续多次启动都没能存活到确认点（默认 30 秒），判定设备已陷入无限注销循环，自动写入 ElleKit 安全模式标记，下次重启即跳过全部插件注入，让用户能进系统卸载问题插件。
 Maintainer: 板栗仁

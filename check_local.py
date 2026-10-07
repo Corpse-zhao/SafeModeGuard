@@ -400,9 +400,18 @@ if "@interface PSSpecifier" not in hdr_nc:
 if '#import "SMRootListController.h"' not in pm_src:
     bad.append('prefs/SMRootListController.m 没有 #import "SMRootListController.h"')
 # .m 用了这些符号 → 头文件里必须有声明
-src_nc = strip_comments(pm_src)
+#
+# ⚠️⚠️ 变量名血泪（2026-10-07）：这里原本写的是 `src_nc = strip_comments(pm_src)`，
+#     而 `src_nc` 在下面「v0.2.0 新增检查」里被当作 **SMGCommon.m 的剥注释正文**使用。
+#     于是检查 21 悄悄把 src_nc 改成了 **prefs** 的内容，
+#     导致检查 25~31 全部在找 prefs 里不可能存在的插件端函数
+#     → 报了一堆「找不到 SMGNoteBootTimeAndCheckRapid / SMGRebootEnabled」，
+#     看起来像"新代码没写进去"，实际是**检查脚本自己把变量覆盖了**。
+#     ⇒ 教训：跨大段代码复用「剥注释正文」这种通用名变量，必然踩变量覆盖的坑。
+#       各检查用各自带前缀的名字（pm_* = prefs，smg_* = 插件端）。
+pm_nc_body = strip_comments(pm_src)
 for sym in ["_specifiers", "reloadSpecifiers", "loadSpecifiersFromPlistName"]:
-    if re.search(r"(?<![\w])" + re.escape(sym) + r"(?![\w])", src_nc) and \
+    if re.search(r"(?<![\w])" + re.escape(sym) + r"(?![\w])", pm_nc_body) and \
        not re.search(r"(?<![\w])" + re.escape(sym) + r"(?![\w])", hdr_nc):
         bad.append("prefs/.m 用了 %s 但头文件里没有声明" % sym)
 if bad:
@@ -417,12 +426,19 @@ print("--- 检查 22：⭐ 调用的函数名必须真实存在（防「名字�
 # （SMPrefs- vs SMG-），Clang 在 C99 下只报 warning + 隐式声明 int
 # → 配合 ARC 变成 4 个 error，全在别人看着莫名其妙的行上。
 # 做法：收集文件内所有函数定义名，再检查所有 `标识符(` 调用是否都有定义或外部声明。
+#
+# ⚠️⚠️ 变量名血泪（2026-10-07）：这里原本写的是 `src = strip_comments(read(path))`，
+#     在循环里反复覆盖全局的 `src`（本应是 SMGCommon.m 的完整正文，见上方检查 6）。
+#     循环最后一个文件是 Tweak.x → 循环结束后 `src` 变成了 **Tweak.x** 的内容！
+#     于是后面检查 25~31 全在 Tweak.x 里找插件端函数 → 全部「找不到」。
+#     ⇒ 这是同一次踩的**第二个变量覆盖坑**（第一个是 src_nc 被 prefs 覆盖）。
+#       修法：循环内用局部名 `f_nc`，绝不复用外部通用名。
 for path in ["prefs/SMRootListController.m", "SMGCommon.m", "Tweak.x"]:
-    src = strip_comments(read(path))
-    defined = set(re.findall(r"\n\s*(?:static\s+)?[\w\s\*<>]*?\b(\w+)\s*\([^;{]*\)\s*\{", src))
-    defined |= set(re.findall(r"@implementation\s+(\w+)", src))
+    f_nc = strip_comments(read(path))
+    defined = set(re.findall(r"\n\s*(?:static\s+)?[\w\s\*<>]*?\b(\w+)\s*\([^;{]*\)\s*\{", f_nc))
+    defined |= set(re.findall(r"@implementation\s+(\w+)", f_nc))
     # 本项目自定义前缀：SMG(插件端) / SMPrefs(面板端)
-    called = set(re.findall(r"(?<![\w.])(SMG|SMPrefs)([A-Z]\w*)\s*\(", src))
+    called = set(re.findall(r"(?<![\w.])(SMG|SMPrefs)([A-Z]\w*)\s*\(", f_nc))
     bad = []
     for pre, rest in sorted(called):
         name = pre + rest
@@ -510,6 +526,160 @@ try:
         print("   （git 索引里没有维护脚本）")
 except Exception as e:
     print("   （git 不可用，跳过索引检查：%s）" % e)
+
+# ---------------------------------------------------------------------------
+# 仅供「函数体提取」用的宽松花括号计数器。
+# ⚠️ 不能用 `\{(.*?)\n\}` 非贪婪匹配 —— 只要函数体里有嵌套块（if/for/@try），
+#    第一个 `\n}` 可能是内层块的收尾，会截出半截函数体 → 断言莫名其妙地失败。
+#    （§63.7 的同款陷阱：校验工具自己出错，却看起来像代码有问题）
+def find_body(src, header_regex):
+    """在 src 里找匹配 header 的函数，返回其函数体字符串（不含最外层大括号）。"""
+    m = re.search(header_regex, src)
+    if not m:
+        return None, None
+    i = m.end() - 1                     # 指向 '{'
+    if src[i] != "{":
+        return None, None
+    depth = 0
+    for j in range(i, len(src)):
+        c = src[j]
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return src[i + 1:j], m.group(0)
+    return None, None
+
+
+print("--- 检查 25：⭐ 频率判定必须「先记本次再判定」---")
+# 逻辑陷阱：如果先数窗口再记本次，第 2 次注销时窗口里只有 1 条 → 永远判不出来，
+# 永远慢一拍。所以要断言：addObject:@(now) 出现在统计循环之前。
+smg_nc = strip_comments(src)   # src = SMGCommon.m（变量名带前缀，避免覆盖）
+body, _ = find_body(smg_nc, r"SMGNoteBootTimeAndCheckRapid\s*\(void\)\s*\{")
+if body is None:
+    fail("❌ 找不到 SMGNoteBootTimeAndCheckRapid")
+else:
+    i_add = body.find("addObject:@(now)")
+    # 统计循环：for (... in times) ... inWindow++
+    m_cnt = re.search(r"for\s*\([^)]*in\s+times\s*\)", body)
+    i_cnt = m_cnt.start() if m_cnt else -1
+    if i_add < 0:
+        fail("❌ 没有把「本次」时间戳加入序列（addObject:@(now)）")
+    elif i_cnt < 0:
+        fail("❌ 找不到窗口内统计循环")
+    elif i_add > i_cnt:
+        fail("❌ 顺序错了：先统计后才记录本次 → 永远慢一拍，第 2 次注销判不出来")
+    else:
+        print("   ✅ 先记本次、再统计（不会慢一拍）")
+
+# ---------------------------------------------------------------------------
+print("--- 检查 26：⭐ 主动重启必须有「只尝试一次」硬闸 ---")
+# 主动重启是本插件唯一的危险操作。它在失控循环里发出重启指令，
+# 必须保证「同一进程内绝不重复发」—— 否则会变成新的循环源。
+if "sSMGRebootAttempted" not in smg_nc:
+    fail("❌ SMGCommon.m 里找不到 sSMGRebootAttempted（只试一次的硬闸）")
+else:
+    body, _ = find_body(smg_nc, r"SMGPerformRebootOnce\s*\(void\)\s*\{")
+    if body is None:
+        fail("❌ 找不到 SMGPerformRebootOnce")
+    else:
+        i_guard = body.find("if (sSMGRebootAttempted)")
+        i_set = body.find("sSMGRebootAttempted = YES")
+        if i_guard < 0 or i_set < 0:
+            fail("❌ SMGPerformRebootOnce 里没有读/写 sSMGRebootAttempted")
+        elif i_guard > i_set:
+            fail("❌ 先赋值后判断 → 硬闸失效（判断永远为真）")
+        else:
+            print("   ✅ 有「只尝试一次」硬闸，且判断先于赋值")
+
+# ---------------------------------------------------------------------------
+print("--- 检查 27：⭐ 主动重启的默认值必须是关闭 ---")
+# 默认开启 = 把危险操作强加给不知情的用户。必须默认关。
+body, _ = find_body(smg_nc, r"BOOL\s+SMGRebootEnabled\s*\(void\)\s*\{")
+if body is None:
+    fail("❌ 找不到 SMGRebootEnabled")
+else:
+    if re.search(r"\?\s*\[v\s+boolValue\]\s*:\s*NO", body):
+        print("   ✅ 插件端 SMGRebootEnabled 默认 NO")
+    else:
+        fail("❌ 插件端 SMGRebootEnabled 默认不是 NO（危险操作必须默认关闭）")
+
+# 面板侧也必须默认关，否则面板显示"开"而插件实际"关"，用户会困惑
+pm_nc = strip_comments(read("prefs/SMRootListController.m"))
+body, _ = find_body(pm_nc, r"getRebootEnabledPref\s*:\([^)]*\)\s*\w+\s*\{")
+if body is None:
+    fail("❌ 找不到 getRebootEnabledPref")
+elif re.search(r":\s*@NO", body):
+    print("   ✅ 面板端 getRebootEnabledPref 默认 @NO")
+else:
+    fail("❌ 面板端 getRebootEnabledPref 默认不是 @NO（会与插件端显示不一致）")
+
+# ---------------------------------------------------------------------------
+print("--- 检查 28：⭐ 主动重启只能在「写标记成功」之后调用 ---")
+# 标记是保底主路径。标记都没写成还去重启 = 纯添乱。
+body, _ = find_body(smg_nc, r"BOOL\s+SMGBootBegin\s*\(void\)\s*\{")
+if body is None:
+    fail("❌ 找不到 SMGBootBegin")
+else:
+    i_call = body.find("SMGPerformRebootOnce()")
+    if i_call < 0:
+        fail("❌ SMGBootBegin 里没有调用 SMGPerformRebootOnce()")
+    else:
+        # 必须处于 if (ok) { ... } 里，其中 ok = SMGEnterSafeMode(...)
+        pre = body[:i_call]
+        if re.search(r"if\s*\(\s*ok\s*\)\s*\{", pre) and "SMGEnterSafeMode" in pre:
+            print("   ✅ 重启调用被包在「写标记成功（if (ok)）」分支内")
+        else:
+            fail("❌ SMGPerformRebootOnce() 不在 if (ok) 分支里 → 标记没写成也会重启，纯添乱")
+
+# ---------------------------------------------------------------------------
+print("--- 检查 29：⭐ 不允许 shell 调用来做重启 ---")
+# sandbox 下的 fork/exec 行为不可控，且 system() 系列在 SpringBoard 里会失败。
+# 必须走 dlsym 探测 + 直接函数调用。
+for pat, why in [(r"\bsystem\s*\(", "system()"), (r"\bpopen\s*\(", "popen()"),
+                 (r"\bposix_spawn\b", "posix_spawn"), (r"\bfork\s*\(", "fork()")]:
+    if re.search(pat, smg_nc):
+        fail("❌ SMGCommon.m 出现 %s —— sandbox 下不可控，重启只能走 dlsym 探测" % why)
+print("   ✅ 无 shell/spawn 类重启手段")
+
+# ---------------------------------------------------------------------------
+print("--- 检查 30：⭐ 启动时间戳文件必须在重置时一并清空 ---")
+# 否则用户点「重置」后，下一次启动可能立刻因为残留时间戳被判为「频率突增」。
+body, _ = find_body(smg_nc, r"void\s+SMGResetAllState\s*\(void\)\s*\{")
+if body is None:
+    fail("❌ 找不到 SMGResetAllState")
+elif "SMGBootTimesPath()" in body:
+    print("   ✅ 重置会清空启动时间戳")
+else:
+    fail("❌ SMGResetAllState 没清 _boottimes.plist → 重置后可能立刻误判")
+
+# 面板侧重置同理
+body, _ = find_body(pm_nc, r"-\s*\(void\)\s*smgResetState\s*\{")
+if body is None:
+    fail("❌ 找不到面板 smgResetState")
+elif "_boottimes.plist" in body:
+    print("   ✅ 面板重置也会清空启动时间戳")
+else:
+    fail("❌ 面板 smgResetState 没清 _boottimes.plist")
+
+# ---------------------------------------------------------------------------
+print("--- 检查 31：⭐ 新配置项默认值两侧必须一致 ---")
+# 面板显示"开"而插件实际"关"（或反之）是最难查的一类 bug。
+pairs = [
+    ("rapidExitEnabled", "SMGRapidExitEnabled", "getRapidEnabledPref", "YES"),
+    ("rebootEnabled",    "SMGRebootEnabled",    "getRebootEnabledPref", "NO"),
+]
+for key, fn, getter, default in pairs:
+    sb, _ = find_body(smg_nc, re.escape(fn) + r"\s*\(void\)\s*\{")
+    pb, _ = find_body(pm_nc, re.escape(getter) + r"\s*:\([^)]*\)\s*\w+\s*\{")
+    s_ok = bool(sb is not None and re.search(r":\s*" + default + r"\b", sb))
+    p_ok = bool(pb is not None and re.search(r":\s*@" + default + r"\b", pb))
+    if s_ok and p_ok:
+        print("   ✅ %s 两侧默认一致（%s）" % (key, default))
+    else:
+        fail("❌ %s 默认值不一致或缺失（插件端默认 %s：%s，面板端：%s）"
+             % (key, default, "OK" if s_ok else "缺失/不符", "OK" if p_ok else "缺失/不符"))
 
 # ---------------------------------------------------------------------------
 print()

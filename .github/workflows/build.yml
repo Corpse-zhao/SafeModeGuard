@@ -501,6 +501,305 @@ jobs:
           print('✅ 无 double-integerValue')
           PY
 
+          echo "--- 检查 25：⭐ 频率判定必须「先记本次再判定」---"
+          python3 - <<'PY' || FAIL=1
+          import io, re, sys
+
+          def read(p):
+              return io.open(p, encoding='utf-8', errors='replace').read()
+
+          def strip_comments(s):
+              s = re.sub(r'/\*.*?\*/', '', s, flags=re.S)
+              return re.sub(r'//[^\n]*', '', s)
+
+          # 仅供「函数体提取」用的宽松花括号计数器。
+          # ⚠️ 不能用 `\{(.*?)\n\}` 非贪婪匹配 —— 只要函数体里有嵌套块（if/for/@try），
+          #    第一个 `\n}` 可能是内层块的收尾，会截出半截函数体 → 断言莫名其妙失败。
+          def find_body(src, header_regex):
+              m = re.search(header_regex, src)
+              if not m:
+                  return None
+              i = m.end() - 1
+              if src[i] != '{':
+                  return None
+              depth = 0
+              for j in range(i, len(src)):
+                  c = src[j]
+                  if c == '{':
+                      depth += 1
+                  elif c == '}':
+                      depth -= 1
+                      if depth == 0:
+                          return src[i + 1:j]
+              return None
+
+          smg = strip_comments(read('SMGCommon.m'))
+
+          body = find_body(smg, r'SMGNoteBootTimeAndCheckRapid\s*\(void\)\s*\{')
+          if body is None:
+              print('❌ 找不到 SMGNoteBootTimeAndCheckRapid'); sys.exit(1)
+          i_add = body.find('addObject:@(now)')
+          m_cnt = re.search(r'for\s*\([^)]*in\s+times\s*\)', body)
+          i_cnt = m_cnt.start() if m_cnt else -1
+          if i_add < 0:
+              print('❌ 没把「本次」时间戳加入序列 → 永远判不出突增'); sys.exit(1)
+          if i_cnt < 0:
+              print('❌ 找不到窗口内统计循环'); sys.exit(1)
+          if i_add > i_cnt:
+              print('❌ 先统计后才记本次 → 永远慢一拍，第 2 次注销判不出来'); sys.exit(1)
+          print('✅ 先记本次、再统计（不会慢一拍）')
+          PY
+
+          echo "--- 检查 26：⭐ 主动重启必须有「只尝试一次」硬闸 ---"
+          python3 - <<'PY' || FAIL=1
+          import io, re, sys
+
+          def read(p):
+              return io.open(p, encoding='utf-8', errors='replace').read()
+
+          def strip_comments(s):
+              s = re.sub(r'/\*.*?\*/', '', s, flags=re.S)
+              return re.sub(r'//[^\n]*', '', s)
+
+          def find_body(src, header_regex):
+              m = re.search(header_regex, src)
+              if not m:
+                  return None
+              i = m.end() - 1
+              if src[i] != '{':
+                  return None
+              depth = 0
+              for j in range(i, len(src)):
+                  c = src[j]
+                  if c == '{':
+                      depth += 1
+                  elif c == '}':
+                      depth -= 1
+                      if depth == 0:
+                          return src[i + 1:j]
+              return None
+
+          smg = strip_comments(read('SMGCommon.m'))
+          if 'sSMGRebootAttempted' not in smg:
+              print('❌ 找不到 sSMGRebootAttempted（只试一次的硬闸）'); sys.exit(1)
+
+          body = find_body(smg, r'SMGPerformRebootOnce\s*\(void\)\s*\{')
+          if body is None:
+              print('❌ 找不到 SMGPerformRebootOnce'); sys.exit(1)
+          i_guard = body.find('if (sSMGRebootAttempted)')
+          i_set = body.find('sSMGRebootAttempted = YES')
+          if i_guard < 0 or i_set < 0:
+              print('❌ SMGPerformRebootOnce 没有读/写 sSMGRebootAttempted'); sys.exit(1)
+          if i_guard > i_set:
+              print('❌ 先赋值后判断 → 硬闸失效（判断永远为真）'); sys.exit(1)
+          print('✅ 有「只尝试一次」硬闸，且判断先于赋值')
+          PY
+
+          echo "--- 检查 27：⭐ 主动重启必须默认关闭（两侧一致）---"
+          python3 - <<'PY' || FAIL=1
+          import io, re, sys
+
+          def read(p):
+              return io.open(p, encoding='utf-8', errors='replace').read()
+
+          def strip_comments(s):
+              s = re.sub(r'/\*.*?\*/', '', s, flags=re.S)
+              return re.sub(r'//[^\n]*', '', s)
+
+          def find_body(src, header_regex):
+              m = re.search(header_regex, src)
+              if not m:
+                  return None
+              i = m.end() - 1
+              if src[i] != '{':
+                  return None
+              depth = 0
+              for j in range(i, len(src)):
+                  c = src[j]
+                  if c == '{':
+                      depth += 1
+                  elif c == '}':
+                      depth -= 1
+                      if depth == 0:
+                          return src[i + 1:j]
+              return None
+
+          smg = strip_comments(read('SMGCommon.m'))
+          pm = strip_comments(read('prefs/SMRootListController.m'))
+
+          body = find_body(smg, r'BOOL\s+SMGRebootEnabled\s*\(void\)\s*\{')
+          if body is None:
+              print('❌ 找不到 SMGRebootEnabled'); sys.exit(1)
+          if not re.search(r'\?\s*\[v\s+boolValue\]\s*:\s*NO', body):
+              print('❌ 插件端 SMGRebootEnabled 默认不是 NO（危险操作必须默认关闭）'); sys.exit(1)
+
+          body = find_body(pm, r'getRebootEnabledPref\s*:\([^)]*\)\s*\w+\s*\{')
+          if body is None:
+              print('❌ 找不到 getRebootEnabledPref'); sys.exit(1)
+          if not re.search(r':\s*@NO', body):
+              print('❌ 面板端 getRebootEnabledPref 默认不是 @NO（会与插件端不一致）'); sys.exit(1)
+          print('✅ 主动重启两侧默认均为关闭（NO / @NO）')
+          PY
+
+          echo "--- 检查 28：⭐ 主动重启只能在「写标记成功」之后调用 ---"
+          python3 - <<'PY' || FAIL=1
+          import io, re, sys
+
+          def read(p):
+              return io.open(p, encoding='utf-8', errors='replace').read()
+
+          def strip_comments(s):
+              s = re.sub(r'/\*.*?\*/', '', s, flags=re.S)
+              return re.sub(r'//[^\n]*', '', s)
+
+          def find_body(src, header_regex):
+              m = re.search(header_regex, src)
+              if not m:
+                  return None
+              i = m.end() - 1
+              if src[i] != '{':
+                  return None
+              depth = 0
+              for j in range(i, len(src)):
+                  c = src[j]
+                  if c == '{':
+                      depth += 1
+                  elif c == '}':
+                      depth -= 1
+                      if depth == 0:
+                          return src[i + 1:j]
+              return None
+
+          smg = strip_comments(read('SMGCommon.m'))
+          body = find_body(smg, r'BOOL\s+SMGBootBegin\s*\(void\)\s*\{')
+          if body is None:
+              print('❌ 找不到 SMGBootBegin'); sys.exit(1)
+          i_call = body.find('SMGPerformRebootOnce()')
+          if i_call < 0:
+              print('❌ SMGBootBegin 没调用 SMGPerformRebootOnce()'); sys.exit(1)
+          pre = body[:i_call]
+          if not (re.search(r'if\s*\(\s*ok\s*\)\s*\{', pre) and 'SMGEnterSafeMode' in pre):
+              print('❌ 重启不在 if (ok) 分支里 → 标记没写成也重启，纯添乱'); sys.exit(1)
+          print('✅ 重启调用被包在「写标记成功（if (ok)）」分支内')
+          PY
+
+          echo "--- 检查 29：⭐ 禁止 shell/spawn 类重启手段 ---"
+          python3 - <<'PY' || FAIL=1
+          import io, re, sys
+
+          def read(p):
+              return io.open(p, encoding='utf-8', errors='replace').read()
+
+          s = re.sub(r'/\*.*?\*/', '', read('SMGCommon.m'), flags=re.S)
+          s = re.sub(r'//[^\n]*', '', s)
+          for pat, why in [(r'\bsystem\s*\(', 'system()'), (r'\bpopen\s*\(', 'popen()'),
+                           (r'\bposix_spawn\b', 'posix_spawn'), (r'\bfork\s*\(', 'fork()')]:
+              if re.search(pat, s):
+                  print('❌ 出现 %s —— sandbox 下不可控，重启只能走 dlsym 探测' % why)
+                  sys.exit(1)
+          print('✅ 无 shell/spawn 类重启手段（走 dlsym 运行时探测）')
+          PY
+
+          echo "--- 检查 30：⭐ 重置必须一并清空启动时间戳 ---"
+          python3 - <<'PY' || FAIL=1
+          import io, re, sys
+
+          def read(p):
+              return io.open(p, encoding='utf-8', errors='replace').read()
+
+          def strip_comments(s):
+              s = re.sub(r'/\*.*?\*/', '', s, flags=re.S)
+              return re.sub(r'//[^\n]*', '', s)
+
+          def find_body(src, header_regex):
+              m = re.search(header_regex, src)
+              if not m:
+                  return None
+              i = m.end() - 1
+              if src[i] != '{':
+                  return None
+              depth = 0
+              for j in range(i, len(src)):
+                  c = src[j]
+                  if c == '{':
+                      depth += 1
+                  elif c == '}':
+                      depth -= 1
+                      if depth == 0:
+                          return src[i + 1:j]
+              return None
+
+          smg = strip_comments(read('SMGCommon.m'))
+          pm = strip_comments(read('prefs/SMRootListController.m'))
+
+          body = find_body(smg, r'void\s+SMGResetAllState\s*\(void\)\s*\{')
+          if body is None:
+              print('❌ 找不到 SMGResetAllState'); sys.exit(1)
+          if 'SMGBootTimesPath()' not in body:
+              print('❌ SMGResetAllState 没清 _boottimes.plist → 重置后可能立刻误判')
+              sys.exit(1)
+
+          body = find_body(pm, r'-\s*\(void\)\s*smgResetState\s*\{')
+          if body is None:
+              print('❌ 找不到面板 smgResetState'); sys.exit(1)
+          if '_boottimes.plist' not in body:
+              print('❌ 面板 smgResetState 没清 _boottimes.plist'); sys.exit(1)
+          print('✅ 插件端与面板端重置都会清空启动时间戳')
+          PY
+
+          echo "--- 检查 31：⭐ 新配置项默认值两侧必须一致 ---"
+          python3 - <<'PY' || FAIL=1
+          import io, re, sys
+
+          def read(p):
+              return io.open(p, encoding='utf-8', errors='replace').read()
+
+          def strip_comments(s):
+              s = re.sub(r'/\*.*?\*/', '', s, flags=re.S)
+              return re.sub(r'//[^\n]*', '', s)
+
+          def find_body(src, header_regex):
+              m = re.search(header_regex, src)
+              if not m:
+                  return None
+              i = m.end() - 1
+              if src[i] != '{':
+                  return None
+              depth = 0
+              for j in range(i, len(src)):
+                  c = src[j]
+                  if c == '{':
+                      depth += 1
+                  elif c == '}':
+                      depth -= 1
+                      if depth == 0:
+                          return src[i + 1:j]
+              return None
+
+          smg = strip_comments(read('SMGCommon.m'))
+          pm = strip_comments(read('prefs/SMRootListController.m'))
+
+          # 面板显示"开"而插件实际"关"（或反之）是最难查的一类 bug
+          pairs = [
+              ('rapidExitEnabled', 'SMGRapidExitEnabled', 'getRapidEnabledPref', 'YES'),
+              ('rebootEnabled',    'SMGRebootEnabled',    'getRebootEnabledPref', 'NO'),
+          ]
+          bad = 0
+          for key, fn, getter, default in pairs:
+              sb = find_body(smg, re.escape(fn) + r'\s*\(void\)\s*\{')
+              pb = find_body(pm, re.escape(getter) + r'\s*:\([^)]*\)\s*\w+\s*\{')
+              s_ok = bool(sb and re.search(r':\s*' + default + r'\b', sb))
+              p_ok = bool(pb and re.search(r':\s*@' + default + r'\b', pb))
+              if s_ok and p_ok:
+                  print('✅ %s 两侧默认一致（%s）' % (key, default))
+              else:
+                  print('❌ %s 默认值不一致或缺失（插件端默认 %s：%s，面板端：%s）'
+                        % (key, default, 'OK' if s_ok else '缺失/不符',
+                           'OK' if p_ok else '缺失/不符'))
+                  bad = 1
+          sys.exit(1 if bad else 0)
+          PY
+
           if [ "$FAIL" -ne 0 ]; then
             echo ""
             echo "🛑 静态自检未通过，拒绝继续编译"
